@@ -1,0 +1,45 @@
+paths:
+  models_dir: "/dtu/blackhole/1d/214141/Thesis/models"
+
+pretrain:
+  ckpt_name: "MRI-knee.pt"
+  model:
+    _target_: models.precond.EDMPrecond
+    model_type: DhariwalUNet
+    img_resolution: 320
+    img_channels: 2
+    label_dim: 0
+    model_channels: 128
+    channel_mult: [1, 1, 1, 2, 2]
+    attn_resolutions: [16]
+    num_blocks: 1
+    dropout: 0.0
+
+dataset:
+  kspace_dir: "/dtu/blackhole/1d/214141/Thesis/data/knee/multicoil_val"
+  maps_dir: "/dtu/blackhole/1d/214141/Thesis/data/knee/multicoil_val_sens_maps_espirit"
+  image_size: [320, 320]
+  filenames: ["file1000196.h5"] # for debugging, use only one file.
+  # For full evaluation, set to None or [] to use all files in kspace_dir.
+
+dataloader:
+  batch_size: 1
+  num_workers: 0
+  pin_memory: true
+
+# MultiCoilMRI generates its own 1D undersampling mask at init.
+# total_lines must match the phase-encode dimension of the cropped data (320).
+forward_op:
+  _target_: "inverse_problems.multi_coil_mri.MultiCoilMRI"
+  total_lines: 320
+  acceleration_ratio: 4
+  pattern: "random"
+
+algorithm:
+  _target_: "algo.dps.DPS"
+  diffusion_scheduler_config:
+    num_steps: 1000
+    schedule: 'vp'
+    timestep: 'vp'
+    scaling: 'vp'
+  guidance_scale: 1.0
