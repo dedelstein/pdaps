@@ -299,6 +299,10 @@ def parse_args():
 
 def run_validation(args):
     entries = method_grid(args.grid_preset)
+    methods_filter = getattr(args, "methods", None)
+    if methods_filter:
+        wanted = {m.strip() for m in methods_filter.split(",") if m.strip()}
+        entries = [e for e in entries if e["method"] in wanted]
     if args.list_grid:
         print(json.dumps(entries, indent=2))
         return None
@@ -368,6 +372,7 @@ def run_from_hydra(cfg):
         verbose=bool(validation.get("verbose", False)),
         list_grid=bool(validation.get("list_grid", False)),
         grid_preset=validation.get("grid_preset", "tiny"),
+        methods=validation.get("methods", None),
     )
     return run_validation(args)
 
