@@ -195,11 +195,13 @@ class pULA(Algo):
                 # --- Likelihood gradient: A^H(y - Ax) ---
                 likelihood_grad = AHy - self.AHA(x)         # (B,H,W) complex
 
-                # --- Build RHS for CG (Eq. 11 from paper) ---
-                # RHS = (A^H A + λI)x + γ * likelihood_grad + score + noise
-                rhs = self.AHA(x) + lam * x                 # (A^H A + λI) x
-                rhs = rhs + self.gamma * likelihood_grad     # + γ * A^H(y - Ax)
-                rhs = rhs + s                                # + score
+                # --- Build RHS for CG ---
+                # EM step: x_new = x + (γ/2) M (lik + score) + sqrt(γ) M z
+                # Implicit form: solve (AHA + λI) x_new = rhs where
+                #   rhs = (AHA + λI)x + (γ/2)(lik + score) + sqrt(γ)·(AH(n1) + sqrt(λ)·n2)
+                rhs = self.AHA(x) + lam * x                       # (A^H A + λI) x
+                rhs = rhs + (self.gamma / 2.0) * likelihood_grad  # + (γ/2) * A^H(y - Ax)
+                rhs = rhs + (self.gamma / 2.0) * s                # + (γ/2) * prior score
 
                 # --- Noise injection (Eq. 10) ---
                 # TODO: draw n1 ~ CN(0, I) in k-space shape, n2 ~ CN(0, I) in image shape
