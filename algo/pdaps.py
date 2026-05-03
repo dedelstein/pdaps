@@ -137,13 +137,23 @@ class PDAPS(Algo):
 
         x_prev = None
         self.last_gate_stats = []
-        steps = tqdm.trange(self.annealing.num_steps, desc="P-DAPS") if verbose else range(self.annealing.num_steps)
+        N = self.annealing.num_steps
+        print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}")
+        steps = tqdm.trange(N, desc="P-DAPS") if verbose else range(N)
         for i in steps:
             sigma = self.annealing.sigma_steps[i]
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
             x_init = self.init_inner(x_prev, x0hat, y)
-            x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, self.annealing.num_steps))
+            x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
+            if i % 20 == 0 or i < 5 or i >= N - 3:
+                msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
+                       f"x0hat.abs.max={x0hat.abs().max().item():.3e} "
+                       f"x_clean.abs.max={x_clean.abs().max().item():.3e}")
+                if verbose:
+                    tqdm.tqdm.write(msg)
+                else:
+                    print(msg)
             x_prev = x_clean
             xt = self.to_real(x_clean + torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1])
 
