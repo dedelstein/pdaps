@@ -146,10 +146,10 @@ class PDAPS(Algo):
             sigma = self.annealing.sigma_steps[i]
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
-            x_init = self.init_inner(x_prev, x0hat, y)
             if sigma > self.inner_sigma_max:
-                x_clean = x_init
+                x_clean = x0hat
             else:
+                x_init = self.init_inner(x_prev, x0hat, y)
                 x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
             if i % 20 == 0 or i < 5 or i >= N - 3:
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "

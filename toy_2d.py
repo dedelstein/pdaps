@@ -734,7 +734,8 @@ def _langevin_inner_preconditioned_warm(x_init, x0_hat, y, sigma, num_steps=20, 
 
 
 def run_pdaps(nb=3000, N=300, sigma_max=1.5, sigma_min=0.005, ode_steps=8,
-              lgvd_steps=20, lgvd_step_size=0.5, budget_steps=None, adversarial_init=False):
+              lgvd_steps=20, lgvd_step_size=0.5, budget_steps=None, adversarial_init=False,
+              inner_sigma_max=float("inf")):
     schedule = make_schedule(N, sigma_max, sigma_min)
     sigmas = schedule.sigmas
     alphas = schedule.alphas
@@ -748,11 +749,14 @@ def run_pdaps(nb=3000, N=300, sigma_max=1.5, sigma_min=0.005, ode_steps=8,
         sigma_next = sigmas[step + 1].item()
         alpha_next = alphas[step + 1].item()
         x0_hat = _reverse_ode(x, sigma, num_steps=ode_steps)
-        try:
-            x0y = _langevin_inner_preconditioned(x0_hat, Y_OBS, sigma, num_steps=lgvd_steps, step_size=lgvd_step_size)
-        except DivergenceError as exc:
-            _record_progress(progress, budget_steps, step, x0_hat, t0)
-            return _diverged_result(x0_hat, progress, exc, step)
+        if sigma > inner_sigma_max:
+            x0y = x0_hat
+        else:
+            try:
+                x0y = _langevin_inner_preconditioned(x0_hat, Y_OBS, sigma, num_steps=lgvd_steps, step_size=lgvd_step_size)
+            except DivergenceError as exc:
+                _record_progress(progress, budget_steps, step, x0_hat, t0)
+                return _diverged_result(x0_hat, progress, exc, step)
         x = _renoise_clean(x0y, sigma_next, alpha_next)
         _record_progress(progress, budget_steps, step, x, t0)
 
@@ -761,7 +765,8 @@ def run_pdaps(nb=3000, N=300, sigma_max=1.5, sigma_min=0.005, ode_steps=8,
 
 def run_pdaps_warm(nb=3000, N=300, sigma_max=1.5, sigma_min=0.005,
                    ode_steps=8, lgvd_steps=20, lgvd_step_size=0.5,
-                   warm_fraction=0.5, budget_steps=None, adversarial_init=False):
+                   warm_fraction=0.5, budget_steps=None, adversarial_init=False,
+                   inner_sigma_max=float("inf")):
     warm_fraction = float(np.clip(warm_fraction, 0.0, 1.0))
     schedule = make_schedule(N, sigma_max, sigma_min)
     sigmas = schedule.sigmas
@@ -778,15 +783,18 @@ def run_pdaps_warm(nb=3000, N=300, sigma_max=1.5, sigma_min=0.005,
         alpha_next = alphas[step + 1].item()
         x_prev = x.detach()
         x0_hat = _reverse_ode(x_prev, sigma, num_steps=ode_steps)
-        x_prev_clean = _clean_from_noised(x_prev, alpha)
-        x_init = warm_fraction * x_prev_clean + (1.0 - warm_fraction) * x0_hat
-        try:
-            x0y = _langevin_inner_preconditioned_warm(
-                x_init, x0_hat, Y_OBS, sigma, num_steps=lgvd_steps, step_size=lgvd_step_size
-            )
-        except DivergenceError as exc:
-            _record_progress(progress, budget_steps, step, x0_hat, t0)
-            return _diverged_result(x0_hat, progress, exc, step)
+        if sigma > inner_sigma_max:
+            x0y = x0_hat
+        else:
+            x_prev_clean = _clean_from_noised(x_prev, alpha)
+            x_init = warm_fraction * x_prev_clean + (1.0 - warm_fraction) * x0_hat
+            try:
+                x0y = _langevin_inner_preconditioned_warm(
+                    x_init, x0_hat, Y_OBS, sigma, num_steps=lgvd_steps, step_size=lgvd_step_size
+                )
+            except DivergenceError as exc:
+                _record_progress(progress, budget_steps, step, x0_hat, t0)
+                return _diverged_result(x0_hat, progress, exc, step)
         x = _renoise_clean(x0y, sigma_next, alpha_next)
         _record_progress(progress, budget_steps, step, x, t0)
 
