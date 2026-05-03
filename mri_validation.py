@@ -60,8 +60,8 @@ DPS_SCHEDULER = {
 
 PULA_SCHEDULER = {
     "num_steps": 200,
-    "sigma_max": 100,
-    "sigma_min": 0.1,
+    "sigma_max": 10,
+    "sigma_min": 0.01,
     "sigma_final": 0,
     "schedule": "linear",
     "timestep": "poly-7",

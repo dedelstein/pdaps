@@ -181,6 +181,7 @@ class pULA(Algo):
 
         # Initialize from posterior with flat prior (Eq. 9)
         x = self.init_sample(AHy, device)
+        print(f"[pULA] after init: x.abs.max={x.abs().max().item():.3e}  AHy.abs.max={AHy.abs().max().item():.3e}")
 
         pbar = tqdm(range(N - 1, -1, -1), desc='pULA')
 
@@ -216,6 +217,8 @@ class pULA(Algo):
                 # warm-started from current x
                 x = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
 
+            if i % 20 == 0 or i < 5:
+                tqdm.write(f"[pULA] outer={i:3d} σ={sigma:.4f} x.abs.max={x.abs().max().item():.3e} s.abs.max={s.abs().max().item():.3e}")
             pbar.set_description(f'pULA σ={sigma:.4f}')
 
         # Convert back to 2-channel real (B,2,H,W) for InverseBench evaluator
