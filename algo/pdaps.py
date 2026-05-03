@@ -52,6 +52,7 @@ class PDAPS(Algo):
         lgvd_config={},
         warm_mode="none",
         warm_fraction=0.0,
+        inner_sigma_max=float("inf"),
         eps=1e-8,
     ):
         super().__init__(net, forward_op)
@@ -62,6 +63,7 @@ class PDAPS(Algo):
         self.inner = MRIInnerPULA(**lgvd_config)
         self.warm_mode = warm_mode
         self.warm_fraction = float(warm_fraction)
+        self.inner_sigma_max = float(inner_sigma_max)
         self.eps = float(eps)
         self.last_gate_stats = []
 
@@ -138,14 +140,17 @@ class PDAPS(Algo):
         x_prev = None
         self.last_gate_stats = []
         N = self.annealing.num_steps
-        print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}")
+        print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}")
         steps = tqdm.trange(N, desc="P-DAPS") if verbose else range(N)
         for i in steps:
             sigma = self.annealing.sigma_steps[i]
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
             x_init = self.init_inner(x_prev, x0hat, y)
-            x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
+            if sigma > self.inner_sigma_max:
+                x_clean = x_init
+            else:
+                x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
             if i % 20 == 0 or i < 5 or i >= N - 3:
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
                        f"x0hat.abs.max={x0hat.abs().max().item():.3e} "

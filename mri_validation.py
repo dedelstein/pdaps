@@ -81,18 +81,30 @@ def method_grid(preset="tiny"):
         pula_gammas = [0.5]
         pdaps_gammas = [0.5]
         warm_fractions = [0.2]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
+    elif preset == "pdaps_inner_sweep":
+        # Single-axis ablation over the inner-correction gating threshold.
+        # Theoretical bound: σ ≲ 1/√(N_inner·γ) ≈ 0.28 for N=25, γ=0.5.
+        dps_scales = []
+        daps_lrs = [1e-5]              # one DAPS reference point
+        pula_gammas = []
+        pdaps_gammas = [0.5]
+        warm_fractions = [0.2]
+        pdaps_inner_sigma_maxes = [0.3, 1.0, 5.0, 20.0, 1e9]
     elif preset == "tiny":
         dps_scales = [0.5, 1.0, 2.0]
         daps_lrs = [3e-6, 1e-5, 3e-5]
         pula_gammas = [0.25, 0.5, 1.0]
         pdaps_gammas = [0.25, 0.5]
         warm_fractions = [0.1, 0.2]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
     elif preset == "full":
         dps_scales = [0.5, 1.0, 2.0]
         daps_lrs = [3e-6, 1e-5, 3e-5]
         pula_gammas = [0.25, 0.5, 1.0]
         pdaps_gammas = [0.25, 0.5, 1.0]
         warm_fractions = [0.1, 0.2, 0.4]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
     else:
         raise ValueError(f"Unknown grid preset: {preset}")
 
@@ -133,18 +145,22 @@ def method_grid(preset="tiny"):
             },
         })
 
-    for p in grid({"gamma": pdaps_gammas}):
-        methods.append(pdaps_entry("P-DAPS", "none", p["gamma"], 0.0))
+    for p in grid({"gamma": pdaps_gammas, "inner_sigma_max": pdaps_inner_sigma_maxes}):
+        methods.append(pdaps_entry("P-DAPS", "none", p["gamma"], 0.0, p["inner_sigma_max"]))
 
-    for p in grid({"gamma": pdaps_gammas, "warm_fraction": warm_fractions}):
-        methods.append(pdaps_entry("P-DAPS-fixed", "fixed", p["gamma"], p["warm_fraction"]))
+    for p in grid({"gamma": pdaps_gammas, "warm_fraction": warm_fractions, "inner_sigma_max": pdaps_inner_sigma_maxes}):
+        methods.append(pdaps_entry("P-DAPS-fixed", "fixed", p["gamma"], p["warm_fraction"], p["inner_sigma_max"]))
     return methods
 
 
-def pdaps_entry(method, warm_mode, gamma, warm_fraction):
+PDAPS_INNER_SIGMA_MAX = 5.0
+
+
+def pdaps_entry(method, warm_mode, gamma, warm_fraction, inner_sigma_max=PDAPS_INNER_SIGMA_MAX):
+    inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     return {
         "method": method,
-        "params": {"gamma": gamma, "warm_fraction": warm_fraction},
+        "params": {"gamma": gamma, "warm_fraction": warm_fraction, "inner_sigma_max": inner_str},
         "algorithm": {
             "_target_": "algo.pdaps.PDAPS",
             "annealing_scheduler_config": ANNEALING,
@@ -152,6 +168,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction):
             "lgvd_config": {"num_steps": 25, "gamma": gamma, "cg_iter": 10, "lr_min_ratio": 0.01},
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
+            "inner_sigma_max": inner_sigma_max,
         },
     }
 
