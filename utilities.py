@@ -4,23 +4,52 @@ import numpy as np
 from libs.inversebench.training.loss import DynamicRangePSNRLoss, DynamicRangeSSIMLoss
 
 
-def compute_metrics(forward_op, reconstruction, target, observation):
+def compute_metrics_dict(forward_op, reconstruction, target, observation):
     dr_psnr = DynamicRangePSNRLoss()
     dr_ssim = DynamicRangeSSIMLoss()
+
+    with torch.no_grad():
+        measurement_residual = forward_op.forward(reconstruction) - observation
+        data_misfit = torch.linalg.norm(measurement_residual).item()
+        observed = measurement_residual.numel()
+        if hasattr(forward_op, "mask"):
+            try:
+                complex_obs = torch.view_as_complex(observation)
+                observed = int(forward_op.mask.expand_as(complex_obs[:1]).sum().item()) * 2
+            except RuntimeError:
+                observed = measurement_residual.numel()
+        data_misfit_per_observed = data_misfit / max(1.0, float(observed) ** 0.5)
+
+        final_recon = forward_op.unnormalize(reconstruction).detach().cpu()
+        final_target = forward_op.unnormalize(target).detach().cpu()
+        psnr_val = -dr_psnr(final_recon, final_target).item()
+        ssim_val = 1 - dr_ssim(final_recon, final_target).item()
+        nmse = (
+            torch.linalg.norm(final_recon - final_target).square()
+            / torch.linalg.norm(final_target).square().clamp_min(1e-12)
+        ).item()
+        finite = bool(torch.isfinite(reconstruction).all().item())
+        max_abs = float(reconstruction.detach().abs().max().item())
+
+    return {
+        "data_misfit": data_misfit,
+        "data_misfit_per_observed": data_misfit_per_observed,
+        "psnr": psnr_val,
+        "ssim": ssim_val,
+        "nmse": nmse,
+        "finite": finite,
+        "max_abs": max_abs,
+    }
+
+
+def compute_metrics(forward_op, reconstruction, target, observation):
+    metrics = compute_metrics_dict(forward_op, reconstruction, target, observation)
     print("\nMetrics:")
 
-    data_misfit = torch.linalg.norm(
-        forward_op.forward(reconstruction) - observation
-    ).item()
-
-    final_recon = forward_op.unnormalize(reconstruction).cpu()
-    final_target = forward_op.unnormalize(target).cpu()
-    psnr_val = -dr_psnr(final_recon, final_target).item()
-    ssim_val = 1 - dr_ssim(final_recon, final_target).item()
-
-    print(f"  Data Misfit: {data_misfit:.4f}")
-    print(f"  PSNR:        {psnr_val:.2f} dB")
-    print(f"  SSIM:        {ssim_val:.4f}")
+    print(f"  Data Misfit: {metrics['data_misfit']:.4f}")
+    print(f"  PSNR:        {metrics['psnr']:.2f} dB")
+    print(f"  SSIM:        {metrics['ssim']:.4f}")
+    return metrics
 
 
 def visualize_recon(forward_op, final_recon, final_target, batch_idx, cfg):

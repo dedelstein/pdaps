@@ -8,7 +8,6 @@ dependencies = [
     "einops>=0.8.2",
     "h5py>=3.16.0",
     "hydra-core>=1.3.2",
-    "inversebench",
     "jax>=0.9.1",
     "matplotlib>=3.10.8",
     "sigpy>=0.1.27",
@@ -22,4 +21,4 @@ members = [
 ]
 
 [tool.uv.sources]
-inversebench = { workspace = true, editable = true }
+inversebench = { workspace = true}

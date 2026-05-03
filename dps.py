@@ -1,12 +1,7 @@
-"""
-DPS / DAPS Multicoil MRI Reconstruction
-"""
-import argparse
 import hydra
 import torch
 import sys
 import os
-
 
 from utilities import compute_metrics, visualize_recon
 
@@ -22,6 +17,11 @@ from dataloader import MultiCoilMRIDataset
 
 @hydra.main(version_base=None, config_path="configs", config_name="daps_config")
 def main(cfg: DictConfig):
+    if cfg.get("mode", "single") == "validation":
+        from mri_validation import run_from_hydra
+
+        run_from_hydra(cfg)
+        return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,21 +67,39 @@ def main(cfg: DictConfig):
         if batch_idx == 0:
             # Debug prints to verify data shapes, types, and check for NaNs/Infs
             print(f"\n--- Batch {batch_idx} ---")
-            print(f"  kspace: {data['kspace'].shape}, dtype={data['kspace'].dtype}, device={data['kspace'].device}")
-            print(f"  maps:   {data['maps'].shape}, dtype={data['maps'].dtype}, device={data['maps'].device}")
-            print(f"  target: {data['target'].shape}, dtype={data['target'].dtype}, device={data['target'].device}")
-            print(f"  kspace has NaN: {torch.isnan(torch.view_as_real(data['kspace'])).any()}, Inf: {torch.isinf(torch.view_as_real(data['kspace'])).any()}")
-            print(f"  maps has NaN: {torch.isnan(torch.view_as_real(data['maps'])).any()}, Inf: {torch.isinf(torch.view_as_real(data['maps'])).any()}")
-            print(f"  target has NaN: {torch.isnan(data['target']).any()}, Inf: {torch.isinf(data['target']).any()}")
-            print(f"  mask: {forward_op.mask.shape}, dtype={forward_op.mask.dtype}, device={forward_op.mask.device}")
+            print(
+                f"  kspace: {data['kspace'].shape}, dtype={data['kspace'].dtype}, device={data['kspace'].device}"
+            )
+            print(
+                f"  maps:   {data['maps'].shape}, dtype={data['maps'].dtype}, device={data['maps'].device}"
+            )
+            print(
+                f"  target: {data['target'].shape}, dtype={data['target'].dtype}, device={data['target'].device}"
+            )
+            print(
+                f"  kspace has NaN: {torch.isnan(torch.view_as_real(data['kspace'])).any()}, Inf: {torch.isinf(torch.view_as_real(data['kspace'])).any()}"
+            )
+            print(
+                f"  maps has NaN: {torch.isnan(torch.view_as_real(data['maps'])).any()}, Inf: {torch.isinf(torch.view_as_real(data['maps'])).any()}"
+            )
+            print(
+                f"  target has NaN: {torch.isnan(data['target']).any()}, Inf: {torch.isinf(data['target']).any()}"
+            )
+            print(
+                f"  mask: {forward_op.mask.shape}, dtype={forward_op.mask.dtype}, device={forward_op.mask.device}"
+            )
 
         observation = forward_op(data)
         target = data["target"]
 
         if batch_idx == 0:
             print(f"  observation: {observation.shape}, dtype={observation.dtype}")
-            print(f"  observation has NaN: {torch.isnan(observation).any()}, Inf: {torch.isinf(observation).any()}")
-            print(f"  forward_op.maps: {forward_op.maps.shape}, dtype={forward_op.maps.dtype}")
+            print(
+                f"  observation has NaN: {torch.isnan(observation).any()}, Inf: {torch.isinf(observation).any()}"
+            )
+            print(
+                f"  forward_op.maps: {forward_op.maps.shape}, dtype={forward_op.maps.dtype}"
+            )
 
         # Inference: iteratively denoise while enforcing data consistency
         print("Running inference...")
@@ -93,10 +111,11 @@ def main(cfg: DictConfig):
             forward_op.unnormalize(reconstruction).cpu(),
             forward_op.unnormalize(target).cpu(),
             batch_idx,
-            cfg
+            cfg,
         )
 
         break  # just one batch for proof of concept
+
 
 if __name__ == "__main__":
     main()
