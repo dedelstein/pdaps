@@ -188,6 +188,7 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir, save_image=Fal
     forward_op = make_forward_op(args, device)
     algo = hydra.utils.instantiate(OmegaConf.create(entry["algorithm"]), forward_op=forward_op, net=net)
     data = move_to_device(sample, device)
+    data = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
     observation = forward_op(data)
     target = data["target"]
 
