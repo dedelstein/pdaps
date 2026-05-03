@@ -183,7 +183,9 @@ class pULA(Algo):
         x = self.init_sample(AHy, device)
         print(f"[pULA] after init: x.abs.max={x.abs().max().item():.3e}  AHy.abs.max={AHy.abs().max().item():.3e}")
 
-        pbar = tqdm(range(N - 1, -1, -1), desc='pULA')
+        # Anneal from sigma_max (sigma_steps[0]) down to sigma_min (sigma_steps[N-1]).
+        # Inversebench's Scheduler stores sigma_steps in decreasing order, so iterate i=0..N-1.
+        pbar = tqdm(range(N), desc='pULA')
 
         for i in pbar:
             sigma = sigmas[i].item()
