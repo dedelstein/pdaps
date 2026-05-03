@@ -149,7 +149,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction):
             "_target_": "algo.pdaps.PDAPS",
             "annealing_scheduler_config": ANNEALING,
             "diffusion_scheduler_config": REVERSE_ODE,
-            "lgvd_config": {"num_steps": 100, "gamma": gamma, "cg_iter": 10, "lr_min_ratio": 0.01},
+            "lgvd_config": {"num_steps": 25, "gamma": gamma, "cg_iter": 10, "lr_min_ratio": 0.01},
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
         },
@@ -325,13 +325,12 @@ def run_validation(args):
     val_samples = samples[:args.val_slices]
     test_samples = samples[args.val_slices:]
 
-    val_rows = [
-        run_one(entry, sample, idx, "validation", net, args, out_dir)
-        for entry in entries
-        for idx, sample in val_samples
-    ]
+    val_rows = []
+    for entry in entries:
+        for idx, sample in val_samples:
+            val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir))
+            write_csv(out_dir / "validation_raw.csv", val_rows)
     val_summary = summarize(val_rows)
-    write_csv(out_dir / "validation_raw.csv", val_rows)
     write_csv(out_dir / "validation_summary.csv", val_summary)
 
     selected = select_best(val_summary)
@@ -339,12 +338,11 @@ def run_validation(args):
     with open(out_dir / "selected.json", "w") as f:
         json.dump(selected, f, indent=2)
 
-    test_rows = [
-        run_one(entry, sample, idx, "test", net, args, out_dir, save_image=True)
-        for entry in selected_entries
-        for idx, sample in test_samples
-    ]
-    write_csv(out_dir / "test_raw.csv", test_rows)
+    test_rows = []
+    for entry in selected_entries:
+        for idx, sample in test_samples:
+            test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir, save_image=True))
+            write_csv(out_dir / "test_raw.csv", test_rows)
     write_csv(out_dir / "test_summary.csv", summarize(test_rows))
     print(f"Wrote {out_dir}")
     return out_dir

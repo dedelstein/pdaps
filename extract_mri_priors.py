@@ -296,21 +296,20 @@ def build_config(template_path, alpha_info, stability_info, efficiency_info, bia
     if alpha is not None:
         cfg["algorithm"]["warm_fraction"] = float(alpha)
 
-    cfg["algorithm"].setdefault("lgvd_config", {})
-    # Note: we deliberately do NOT scale the template's Langevin lr by a
-    # toy-derived ratio. The previous "stability ratio" was a grid artefact
-    # (both endpoints censored). The qualitative stability finding lives in
+    lgvd = cfg["algorithm"].setdefault("lgvd_config", {})
+    # We deliberately do NOT scale the template's Langevin lr by a toy-derived
+    # ratio. The previous "stability ratio" was a grid artefact (both endpoints
+    # censored). The qualitative stability finding lives in
     # _extraction_provenance.stability instead.
 
-    anneal = cfg["algorithm"].setdefault("annealing_scheduler_config", {})
     if efficiency_info.get("status") == "ok":
         mult = efficiency_info["efficiency_multiplier"]
         if mult > 1.0:
-            current_steps = int(anneal.get("num_steps", 200))
-            reduced = max(20, int(round(current_steps / mult)))
-            anneal["num_steps"] = reduced
-            anneal["_num_steps_scaling_note"] = (
-                f"divided template num_steps by efficiency multiplier {mult:.2f}"
+            current_inner = int(lgvd.get("num_steps", 100))
+            reduced = max(5, int(round(current_inner / mult)))
+            lgvd["num_steps"] = reduced
+            lgvd["_num_steps_scaling_note"] = (
+                f"divided template lgvd_config.num_steps by efficiency multiplier {mult:.2f}"
                 f" (DAPS nfe_to_converge {efficiency_info['daps_nfe_to_converge']:.0f},"
                 f" P-DAPS nfe_to_converge {efficiency_info['pdaps_nfe_to_converge']:.0f})"
             )
