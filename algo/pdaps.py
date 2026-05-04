@@ -181,17 +181,17 @@ class PDAPS(Algo):
                 x_init = self.init_inner(x_prev, x0hat, y)
                 x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
                 inner_dist = (x_clean - x0hat).abs().mean().item()
-                if self.log_level == "DEBUG":
-                    inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
-                else:
-                    inner_stats = ""
+                inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5 or i >= N - 3:
-                resid = self.residual_norm(x_clean, y).mean().item()
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
                        f"x0hat.max={x0hat.abs().max().item():.3e} "
-                       f"x_clean.max={x_clean.abs().max().item():.3e} "
-                       f"resid={resid:.3e}{inner_stats}")
+                       f"x_clean.max={x_clean.abs().max().item():.3e}")
+                
+                if self.log_level == "DEBUG":
+                    resid = self.residual_norm(x_clean, y).mean().item()
+                    msg += f" resid={resid:.3e}{inner_stats}"
+
                 if self.log_level in ["INFO", "DEBUG"]:
                     if verbose:
                         tqdm.tqdm.write(msg)

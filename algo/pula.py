@@ -310,17 +310,17 @@ class pULA(Algo):
                 x, cg_iters = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5:
-                # Residual: ||A(x) - y||_2
-                Ax = self.A(x)
-                m = max(1.0, float(self.forward_op.mask.expand_as(y[:1]).sum().item()))
-                resid = (Ax - y).abs().square().flatten(start_dim=1).sum(dim=1).sqrt().mean().item() / math.sqrt(m)
-                
                 msg = (f"[pULA] outer={i:3d} σ={sigma:.4f} x.max={x.abs().max().item():.3e} "
-                       f"s.max={s.abs().max().item():.3e} resid={resid:.3e}")
+                       f"s.max={s.abs().max().item():.3e}")
+                
                 if self.log_level == "DEBUG":
+                    Ax = self.A(x)
+                    m = max(1.0, float(self.forward_op.mask.expand_as(y[:1]).sum().item()))
+                    resid = (Ax - y).abs().square().flatten(start_dim=1).sum(dim=1).sqrt().mean().item() / math.sqrt(m)
                     drift_norm = step_drift.abs().mean().item()
                     noise_norm = step_noise.abs().mean().item()
-                    msg += f" CG_iters={cg_iters} drift={drift_norm:.3e} noise={noise_norm:.3e}"
+                    msg += (f" resid={resid:.3e} CG={cg_iters} "
+                            f"drift={drift_norm:.3e} noise={noise_norm:.3e}")
                 
                 if self.log_level in ["INFO", "DEBUG"]:
                     if verbose:

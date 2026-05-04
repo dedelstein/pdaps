@@ -75,7 +75,7 @@ def grid(points):
         yield dict(zip(keys, values))
 
 
-def method_grid(preset="tiny"):
+def method_grid(preset="tiny", log_level="INFO"):
     pdaps_num_steps_list = [25]   # default unless preset overrides
     if preset == "smoke":
         dps_scales = [1.0]
@@ -176,19 +176,20 @@ def method_grid(preset="tiny"):
                 "K": 4,
                 "gamma": p["gamma"],
                 "cg_iter": 10,
+                "log_level": log_level,
             },
         })
 
     for p in grid({"gamma": pdaps_gammas, "inner_sigma_max": pdaps_inner_sigma_maxes,
                    "lgvd_num_steps": pdaps_num_steps_list}):
         methods.append(pdaps_entry("P-DAPS", "none", p["gamma"], 0.0,
-                                   p["inner_sigma_max"], p["lgvd_num_steps"]))
+                                   p["inner_sigma_max"], p["lgvd_num_steps"], log_level))
 
     for p in grid({"gamma": pdaps_gammas, "warm_fraction": warm_fractions,
                    "inner_sigma_max": pdaps_inner_sigma_maxes,
                    "lgvd_num_steps": pdaps_num_steps_list}):
         methods.append(pdaps_entry("P-DAPS-fixed", "fixed", p["gamma"], p["warm_fraction"],
-                                   p["inner_sigma_max"], p["lgvd_num_steps"]))
+                                   p["inner_sigma_max"], p["lgvd_num_steps"], log_level))
     return methods
 
 
@@ -196,7 +197,7 @@ PDAPS_INNER_SIGMA_MAX = 5.0
 
 
 def pdaps_entry(method, warm_mode, gamma, warm_fraction,
-                inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25):
+                inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25, log_level="INFO"):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     return {
         "method": method,
@@ -213,6 +214,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
             "inner_sigma_max": inner_sigma_max,
+            "log_level": log_level,
         },
     }
 
@@ -277,6 +279,11 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
             row["error"] = "nonfinite_reconstruction_or_metrics"
         row["runtime_s"] = time.perf_counter() - start
         row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
+        
+        status_str = "[FAILED]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
+        print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
+              f"{status_str} DataMisfit={row.get('data_misfit', 0.0):.3e} Time={row['runtime_s']:.1f}s")
+
         if save_image and not row["failed"]:
             cfg = OmegaConf.create({
                 "algorithm": {"_target_": entry["algorithm"]["_target_"]},
@@ -367,6 +374,8 @@ def parse_args():
     parser.add_argument("--val-slices", type=int, default=2)
     parser.add_argument("--test-slices", type=int, default=3)
     parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="INFO")
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep", "iso_nfe", "warm_sweep"),
                         default="tiny")
@@ -496,6 +505,7 @@ def run_from_hydra(cfg):
         list_grid=bool(validation.get("list_grid", False)),
         grid_preset=validation.get("grid_preset", "tiny"),
         methods=validation.get("methods", None),
+        log_level=validation.get("log_level", "INFO"),
     )
     return run_validation(args)
 
@@ -506,3 +516,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+n()
