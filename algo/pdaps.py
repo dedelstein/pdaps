@@ -4,19 +4,32 @@ import torch
 import tqdm
 
 from algo.base import Algo
-from algo.pula import conjgrad
+from algo.pula import conjgrad, mri_A, mri_AH, mri_AHA
 from utils.diffusion import DiffusionSampler
 from utils.scheduler import Scheduler
 
 
 class MRIInnerPULA:
-    def __init__(self, num_steps, step_size=None, gamma=None, lr=None, cg_iter=10, lr_min_ratio=1.0, tau=None):
+    def __init__(
+        self,
+        num_steps,
+        step_size=None,
+        gamma=None,
+        lr=None,
+        cg_iter=10,
+        lr_min_ratio=1.0,
+        tau=None,
+        check_finite=False,
+        finite_check_interval=1,
+    ):
         self.num_steps = int(num_steps)
         if step_size is None:
             step_size = gamma if gamma is not None else lr
         self.step_size = float(0.5 if step_size is None else step_size)
         self.cg_iter = int(cg_iter)
         self.lr_min_ratio = float(lr_min_ratio)
+        self.check_finite = bool(check_finite)
+        self.finite_check_interval = max(1, int(finite_check_interval))
 
     def step(self, pdaps, x, x0hat, y, sigma, ratio):
         lam = 1.0 / float(sigma) ** 2
@@ -35,9 +48,12 @@ class MRIInnerPULA:
     def sample(self, pdaps, x, x0hat, y, sigma, ratio):
         x = x.detach()
         x0hat = x0hat.detach()
-        for _ in range(self.num_steps):
+        for step in range(self.num_steps):
             x = self.step(pdaps, x, x0hat, y, sigma, ratio)
-            if not torch.isfinite(torch.view_as_real(x)).all():
+            should_check = self.check_finite and (
+                step == self.num_steps - 1 or (step + 1) % self.finite_check_interval == 0
+            )
+            if should_check and not torch.isfinite(torch.view_as_real(x)).all():
                 return torch.zeros_like(x)
         return x.detach()
 
@@ -54,6 +70,7 @@ class PDAPS(Algo):
         warm_fraction=0.0,
         inner_sigma_max=float("inf"),
         eps=1e-8,
+        use_fast_aha=True,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -65,6 +82,7 @@ class PDAPS(Algo):
         self.warm_fraction = float(warm_fraction)
         self.inner_sigma_max = float(inner_sigma_max)
         self.eps = float(eps)
+        self.use_fast_aha = bool(use_fast_aha)
         self.last_gate_stats = []
 
     @staticmethod
@@ -76,16 +94,16 @@ class PDAPS(Algo):
         return torch.stack([x.real, x.imag], dim=1)
 
     def A(self, x):
-        return self.forward_op.mask * self.forward_op.fft(self.forward_op.maps * x.unsqueeze(1))
+        return mri_A(self, x)
 
     def AH(self, y):
-        return (self.forward_op.ifft(y) * self.forward_op.maps.conj()).sum(dim=1)
+        return mri_AH(self, y)
 
     def AHA(self, x):
-        return self.AH(self.A(x))
+        return mri_AHA(self, x)
 
     def solve(self, rhs, lam):
-        return conjgrad(self.AHA, rhs, torch.zeros_like(rhs), lam, self.inner.cg_iter)
+        return conjgrad(self.AHA, rhs, torch.zeros_like(rhs), lam, self.inner.cg_iter, x_is_zero=True)
 
     def residual_norm(self, x, y):
         r = self.A(x) - y

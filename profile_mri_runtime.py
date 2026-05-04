@@ -46,9 +46,22 @@ def parse_args():
     parser.add_argument("--inner-steps", type=int, default=None)
     parser.add_argument("--pula-k", type=int, default=None)
     parser.add_argument("--cg-iter", type=int, default=None)
+    parser.add_argument("--no-fast-aha", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--compile-net", action="store_true")
     parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument(
+        "--compile-warmup",
+        type=int,
+        default=0,
+        help="Run this many dummy net forwards after torch.compile and before profiling.",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=("highest", "high", "medium"),
+        default=None,
+        help="Forwarded to torch.set_float32_matmul_precision. 'high' enables TF32-style speedups on Ampere+.",
+    )
     parser.add_argument("--torch-profiler", action="store_true")
     parser.add_argument("--profiler-rows", type=int, default=25)
     parser.add_argument("--trace-path", default=None)
@@ -89,6 +102,8 @@ def override_steps(entry, args):
             algorithm["lgvd_config"]["cg_iter"] = args.cg_iter
         if "cg_iter" in algorithm:
             algorithm["cg_iter"] = args.cg_iter
+    if args.no_fast_aha:
+        algorithm["use_fast_aha"] = False
     return entry
 
 
@@ -154,6 +169,9 @@ def profiler_activities(device):
 
 
 def run_profile(args):
+    if args.matmul_precision is not None:
+        torch.set_float32_matmul_precision(args.matmul_precision)
+
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -167,6 +185,19 @@ def run_profile(args):
     net = load_model(args, device)
     if args.compile_net:
         net = torch.compile(net, mode=args.compile_mode)
+        if args.compile_warmup > 0:
+            x = torch.randn(
+                args.num_samples,
+                2,
+                args.image_size[0],
+                args.image_size[1],
+                device=device,
+            )
+            sigma = torch.tensor(1.0, device=device)
+            with torch.inference_mode():
+                for _ in range(args.compile_warmup):
+                    net(x, sigma)
+            synchronize_if_needed(device, True)
 
     dataset = MultiCoilMRIDataset(args.kspace_dir, args.maps_dir, args.image_size, filenames=[args.filename])
     sample = dataset[args.slice_offset]

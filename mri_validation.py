@@ -119,6 +119,18 @@ def method_grid(preset="tiny"):
         pdaps_gammas = [0.25, 0.5]
         warm_fractions = [0.1, 0.2]
         pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
+    elif preset == "probe":
+        # Exploratory grid: wider than `tiny`, still tractable on an L40s.
+        # Extends the *stiff* end (lower DAPS lr, lower pULA γ) so the R=8
+        # acceleration regime is actually probed instead of hitting the wall
+        # of the R=4-tuned grid. Warm-fraction range widened to match toy's
+        # safe band [0.1, 0.3] plus 0.5 as a stress point.
+        dps_scales = [0.5, 1.0, 2.0, 4.0]
+        daps_lrs = [1e-6, 3e-6, 1e-5, 3e-5]
+        pula_gammas = [0.1, 0.25, 0.5, 1.0]
+        pdaps_gammas = [0.25, 0.5]
+        warm_fractions = [0.1, 0.2, 0.3, 0.5]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
     elif preset == "full":
         dps_scales = [0.5, 1.0, 2.0]
         daps_lrs = [3e-6, 1e-5, 3e-5]
@@ -227,7 +239,8 @@ def move_to_device(data, device):
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
 
 
-def run_one(entry, sample, sample_idx, split, net, args, out_dir, save_image=False):
+def run_one(entry, sample, sample_idx, split, net, args, out_dir,
+            save_image=False, filename=None):
     device = next(net.parameters()).device
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -243,6 +256,8 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir, save_image=Fal
     row = {
         "split": split,
         "sample_idx": sample_idx,
+        "filename": filename,
+        "acceleration": args.acceleration,
         "method": entry["method"],
         "params_json": json.dumps(entry["params"], sort_keys=True),
         "failed": False,
@@ -330,8 +345,15 @@ def parse_args():
     parser.add_argument("--kspace-dir", default="/dtu/blackhole/1d/214141/Thesis/data/knee/multicoil_val")
     parser.add_argument("--maps-dir", default="/dtu/blackhole/1d/214141/Thesis/data/knee/multicoil_val_sens_maps_espirit")
     parser.add_argument("--filename", default="file1000196.h5")
+    parser.add_argument("--filenames", nargs="+", default=None,
+                        help="Multiple filenames for multi-patient runs. If given, "
+                             "--val-slices and --test-slices are interpreted *per file*. "
+                             "Overrides --filename.")
     parser.add_argument("--image-size", nargs=2, type=int, default=[320, 320])
     parser.add_argument("--acceleration", type=int, default=4)
+    parser.add_argument("--accelerations", nargs="+", type=int, default=None,
+                        help="If given, sweep these accelerations (e.g. --accelerations 4 8). "
+                             "Each runs the full val→select→test pipeline in its own subdir.")
     parser.add_argument("--pattern", default="random")
     parser.add_argument("--mask-seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
@@ -339,10 +361,68 @@ def parse_args():
     parser.add_argument("--val-slices", type=int, default=2)
     parser.add_argument("--test-slices", type=int, default=3)
     parser.add_argument("--out-dir", default=None)
-    parser.add_argument("--grid-preset", choices=("smoke", "tiny", "full"), default="tiny")
+    parser.add_argument("--grid-preset",
+                        choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep", "iso_nfe", "warm_sweep"),
+                        default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
     return parser.parse_args()
+
+
+def _select_samples(dataset, slice_offset, val_slices, test_slices):
+    """
+    Pick `val_slices + test_slices` slices from each file in the dataset,
+    starting at `slice_offset` within that file. Returns
+    (val_samples, test_samples) where each is a list of
+    (global_idx, filename, sample_dict). val_samples is the first
+    `val_slices` from each file; test_samples is the remaining
+    `test_slices` from each file.
+    """
+    by_file = {}
+    for global_idx, (kspace_path, _maps_path, _slice) in enumerate(dataset.samples):
+        by_file.setdefault(kspace_path.name, []).append(global_idx)
+
+    val_samples, test_samples = [], []
+    for filename, global_indices in by_file.items():
+        wanted = global_indices[slice_offset:slice_offset + val_slices + test_slices]
+        if len(wanted) < val_slices + test_slices:
+            print(f"Warning: {filename} has only {len(wanted)} usable slices at offset "
+                  f"{slice_offset} (wanted {val_slices + test_slices}), using what's available")
+        for i, global_idx in enumerate(wanted):
+            entry = (global_idx, filename, dataset[global_idx])
+            (val_samples if i < val_slices else test_samples).append(entry)
+    return val_samples, test_samples
+
+
+def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "args.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+    with open(out_dir / "grid.json", "w") as f:
+        json.dump(entries, f, indent=2)
+
+    val_rows = []
+    for entry in entries:
+        for idx, filename, sample in val_samples:
+            val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir,
+                                    filename=filename))
+            write_csv(out_dir / "validation_raw.csv", val_rows)
+    val_summary = summarize(val_rows)
+    write_csv(out_dir / "validation_summary.csv", val_summary)
+
+    selected = select_best(val_summary)
+    selected_entries = [entry for entry in entries if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)]
+    with open(out_dir / "selected.json", "w") as f:
+        json.dump(selected, f, indent=2)
+
+    test_rows = []
+    for entry in selected_entries:
+        for idx, filename, sample in test_samples:
+            test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
+                                     save_image=True, filename=filename))
+            write_csv(out_dir / "test_raw.csv", test_rows)
+    write_csv(out_dir / "test_summary.csv", summarize(test_rows))
+    print(f"Wrote {out_dir}")
 
 
 def run_validation(args):
@@ -362,41 +442,28 @@ def run_validation(args):
         except ValueError:
             out_dir = PROJECT_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "args.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
-    with open(out_dir / "grid.json", "w") as f:
-        json.dump(entries, f, indent=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = load_model(args, device)
-    dataset = MultiCoilMRIDataset(args.kspace_dir, args.maps_dir, args.image_size, filenames=[args.filename])
 
-    n = args.val_slices + args.test_slices
-    indices = list(range(args.slice_offset, args.slice_offset + n))
-    samples = [(idx, dataset[idx]) for idx in indices]
-    val_samples = samples[:args.val_slices]
-    test_samples = samples[args.val_slices:]
+    files = args.filenames if args.filenames else [args.filename]
+    dataset = MultiCoilMRIDataset(args.kspace_dir, args.maps_dir, args.image_size, filenames=files)
+    val_samples, test_samples = _select_samples(dataset, args.slice_offset,
+                                                args.val_slices, args.test_slices)
+    print(f"Selected {len(val_samples)} val + {len(test_samples)} test slices "
+          f"across {len(files)} file(s) "
+          f"({args.val_slices} val + {args.test_slices} test per file).")
 
-    val_rows = []
-    for entry in entries:
-        for idx, sample in val_samples:
-            val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir))
-            write_csv(out_dir / "validation_raw.csv", val_rows)
-    val_summary = summarize(val_rows)
-    write_csv(out_dir / "validation_summary.csv", val_summary)
-
-    selected = select_best(val_summary)
-    selected_entries = [entry for entry in entries if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)]
-    with open(out_dir / "selected.json", "w") as f:
-        json.dump(selected, f, indent=2)
-
-    test_rows = []
-    for entry in selected_entries:
-        for idx, sample in test_samples:
-            test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir, save_image=True))
-            write_csv(out_dir / "test_raw.csv", test_rows)
-    write_csv(out_dir / "test_summary.csv", summarize(test_rows))
-    print(f"Wrote {out_dir}")
+    accelerations = args.accelerations if args.accelerations else [args.acceleration]
+    if len(accelerations) == 1:
+        args.acceleration = accelerations[0]
+        _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir)
+    else:
+        for accel in accelerations:
+            args.acceleration = accel
+            sub_dir = out_dir / f"accel_{accel}"
+            print(f"=== acceleration {accel}x → {sub_dir} ===")
+            _run_one_acceleration(args, entries, net, val_samples, test_samples, sub_dir)
     return out_dir
 
 
@@ -408,8 +475,10 @@ def run_from_hydra(cfg):
         kspace_dir=cfg.dataset.kspace_dir,
         maps_dir=cfg.dataset.maps_dir,
         filename=validation.get("filename", cfg.dataset.get("filenames", ["file1000196.h5"])[0]),
+        filenames=list(validation.get("filenames", cfg.dataset.get("filenames", []))) or None,
         image_size=list(cfg.dataset.image_size),
         acceleration=int(cfg.forward_op.acceleration_ratio),
+        accelerations=[int(a) for a in validation.get("accelerations", [])] or None,
         pattern=cfg.forward_op.get("pattern", "random"),
         mask_seed=int(cfg.forward_op.get("mask_seed", 0)),
         seed=int(validation.get("seed", 123)),

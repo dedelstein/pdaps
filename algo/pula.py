@@ -12,7 +12,7 @@ from utils.scheduler import Scheduler
 # -----------------------------------------------------------------------------------------------
 
 
-def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10):
+def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
     """
     Conjugate gradient solver for (A^H A + λI) x = b.
 
@@ -26,11 +26,12 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10):
         lam: scalar regularization (1/σ² for pULA)
         max_iter: number of CG iterations
         tol: early stopping tolerance on residual norm
+        x_is_zero: skip the initial normal_op(x) when x is known to be zero
     Returns:
         x: solution tensor (complex)
     """
     # r = b - (A^H A + λI) x
-    r = b - normal_op(x) - lam * x
+    r = b.clone() if x_is_zero else b - normal_op(x) - lam * x
     p = r.clone()
     rs_old = torch.sum(r.conj() * r).real
 
@@ -51,6 +52,96 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10):
     return x
 
 
+def _mri_fft_cache(algo):
+    maps = algo.forward_op.maps
+    mask = algo.forward_op.mask
+    even_shape = maps.shape[-2] % 2 == 0 and maps.shape[-1] % 2 == 0
+    key = (
+        maps.data_ptr(),
+        mask.data_ptr(),
+        tuple(maps.shape),
+        tuple(mask.shape),
+        maps.device,
+        mask.device,
+        maps.dtype,
+        mask.dtype,
+        even_shape,
+    )
+    if getattr(algo, "_mri_fft_cache_key", None) != key:
+        algo._mri_fft_cache_key = key
+        algo._mri_even_shape = even_shape
+        if even_shape:
+            algo._mri_maps_shift = torch.fft.fftshift(maps, dim=(-2, -1))
+            algo._mri_maps_shift_conj = algo._mri_maps_shift.conj()
+            algo._mri_mask_unshift = torch.fft.ifftshift(mask, dim=(-2, -1))
+        else:
+            algo._mri_maps_shift = None
+            algo._mri_maps_shift_conj = None
+            algo._mri_mask_unshift = None
+    return algo._mri_even_shape, algo._mri_maps_shift, algo._mri_maps_shift_conj, algo._mri_mask_unshift
+
+
+def _centered_fft(x, dim):
+    return torch.fft.ifftshift(
+        torch.fft.fft(torch.fft.fftshift(x, dim=dim), dim=dim, norm="ortho"),
+        dim=dim,
+    )
+
+
+def _centered_ifft(x, dim):
+    return torch.fft.fftshift(
+        torch.fft.ifft(torch.fft.ifftshift(x, dim=dim), dim=dim, norm="ortho"),
+        dim=dim,
+    )
+
+
+def _mri_cartesian_mask_dim(algo):
+    mask = algo.forward_op.mask
+    if mask.shape[-2] == 1 and mask.shape[-1] > 1:
+        return -1
+    if mask.shape[-1] == 1 and mask.shape[-2] > 1:
+        return -2
+    return None
+
+
+def mri_A(algo, x):
+    even_shape, maps_shift, _, mask_unshift = _mri_fft_cache(algo)
+    if not even_shape:
+        coils = algo.forward_op.maps * x.unsqueeze(1)
+        return algo.forward_op.mask * algo.forward_op.fft(coils)
+
+    x_shift = torch.fft.fftshift(x, dim=(-2, -1))
+    kspace_unshift = torch.fft.fft2(maps_shift * x_shift.unsqueeze(1), dim=(-2, -1), norm="ortho")
+    return torch.fft.fftshift(mask_unshift * kspace_unshift, dim=(-2, -1))
+
+
+def mri_AH(algo, y):
+    even_shape, maps_shift, maps_shift_conj, _ = _mri_fft_cache(algo)
+    if not even_shape:
+        return (algo.forward_op.ifft(y) * algo.forward_op.maps.conj()).sum(dim=1)
+
+    y_unshift = torch.fft.ifftshift(y, dim=(-2, -1))
+    image_shift = torch.fft.ifft2(y_unshift, dim=(-2, -1), norm="ortho")
+    return torch.fft.fftshift((image_shift * maps_shift_conj).sum(dim=1), dim=(-2, -1))
+
+
+def mri_AHA(algo, x):
+    even_shape, maps_shift, maps_shift_conj, mask_unshift = _mri_fft_cache(algo)
+    mask_dim = _mri_cartesian_mask_dim(algo)
+    if getattr(algo, "use_fast_aha", True) and even_shape and mask_dim is not None:
+        coils = algo.forward_op.maps * x.unsqueeze(1)
+        masked = algo.forward_op.mask * _centered_fft(coils, dim=mask_dim)
+        return (_centered_ifft(masked, dim=mask_dim) * algo.forward_op.maps.conj()).sum(dim=1)
+
+    if not even_shape:
+        return mri_AH(algo, mri_A(algo, x))
+
+    x_shift = torch.fft.fftshift(x, dim=(-2, -1))
+    kspace_unshift = torch.fft.fft2(maps_shift * x_shift.unsqueeze(1), dim=(-2, -1), norm="ortho")
+    image_shift = torch.fft.ifft2(mask_unshift * kspace_unshift, dim=(-2, -1), norm="ortho")
+    return torch.fft.fftshift((image_shift * maps_shift_conj).sum(dim=1), dim=(-2, -1))
+
+
 class pULA(Algo):
     """
     Preconditioned Unadjusted Langevin Algorithm for multicoil MRI.
@@ -64,27 +155,28 @@ class pULA(Algo):
                  noise_scheduler_config,
                  K=4,            # Langevin steps per noise level
                  gamma=0.5,      # fixed step size
-                 cg_iter=10):    # CG iterations for preconditioning
+                 cg_iter=10,     # CG iterations for preconditioning
+                 use_fast_aha=True):
         super().__init__(net, forward_op)
         self.noise_scheduler = Scheduler(**noise_scheduler_config)
         self.K = K
         self.gamma = gamma
         self.cg_iter = cg_iter
+        self.use_fast_aha = bool(use_fast_aha)
 
     # -- Complex-domain MRI operators using forward_op internals --
 
     def A(self, x):
         """Forward: complex image (B,H,W) -> masked complex k-space (B,C,H,W)."""
-        coils = self.forward_op.maps * x.unsqueeze(1)       # (B,C,H,W)
-        return self.forward_op.mask * self.forward_op.fft(coils)
+        return mri_A(self, x)
 
     def AH(self, y):
         """Adjoint: masked complex k-space (B,C,H,W) -> complex image (B,H,W)."""
-        return (self.forward_op.ifft(y) * self.forward_op.maps.conj()).sum(dim=1)
+        return mri_AH(self, y)
 
     def AHA(self, x):
         """Normal operator: A^H A x."""
-        return self.AH(self.A(x))
+        return mri_AHA(self, x)
 
     # -- Conversions between 2-channel real (B,2,H,W) and complex (B,H,W) --
 
@@ -147,7 +239,7 @@ class pULA(Algo):
 
         # Solve (A^H A + λI) x = rhs, starting from zeros
         x = torch.zeros(B, H, W, dtype=torch.cfloat, device=device)
-        x = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
+        x = conjgrad(self.AHA, rhs, x, lam, self.cg_iter, x_is_zero=True)
 
         return x
 
@@ -196,13 +288,14 @@ class pULA(Algo):
                 s = self.score(x, sigma)                    # (B,H,W) complex
 
                 # --- Likelihood gradient: A^H(y - Ax) ---
-                likelihood_grad = AHy - self.AHA(x)         # (B,H,W) complex
+                AHAx = self.AHA(x)                          # (B,H,W) complex
+                likelihood_grad = AHy - AHAx                # (B,H,W) complex
 
                 # --- Build RHS for CG ---
                 # EM step: x_new = x + (γ/2) M (lik + score) + sqrt(γ) M z
                 # Implicit form: solve (AHA + λI) x_new = rhs where
                 #   rhs = (AHA + λI)x + (γ/2)(lik + score) + sqrt(γ)·(AH(n1) + sqrt(λ)·n2)
-                rhs = self.AHA(x) + lam * x                       # (A^H A + λI) x
+                rhs = AHAx + lam * x                              # (A^H A + λI) x
                 rhs = rhs + (self.gamma / 2.0) * likelihood_grad  # + (γ/2) * A^H(y - Ax)
                 rhs = rhs + (self.gamma / 2.0) * s                # + (γ/2) * prior score
 
