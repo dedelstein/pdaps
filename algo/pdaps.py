@@ -31,39 +31,55 @@ class MRIInnerPULA:
         self.check_finite = bool(check_finite)
         self.finite_check_interval = max(1, int(finite_check_interval))
 
-    def step(self, pdaps, x, x0hat, y, sigma, ratio):
+    def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False):
         lam = 1.0 / float(sigma) ** 2
         gamma = self.step_size * (1.0 + ratio * (self.lr_min_ratio - 1.0))
 
         score_lik = pdaps.AH(y - pdaps.A(x))
         score_prior = -(x - x0hat) * lam
-        drift, cg_drift = pdaps.solve(score_lik + score_prior, lam)
+        drift = pdaps.solve(score_lik + score_prior, lam, return_iters=return_stats)
+        if return_stats:
+            drift, cg_drift = drift
 
+        # torch complex randn has Var(real)=Var(imag)=1/2; scale by sqrt(2)
+        # to match independent unit-variance real/imag Langevin noise.
         n1 = math.sqrt(2.0) * torch.randn_like(y)
         n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-        noise, cg_noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam)
+        noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats)
+        if return_stats:
+            noise, cg_noise = noise
 
         step_drift = 0.5 * gamma * drift
         step_noise = math.sqrt(gamma) * noise
-        
-        return x + step_drift + step_noise, step_drift.abs().mean().item(), step_noise.abs().mean().item(), cg_drift + cg_noise
 
-    def sample(self, pdaps, x, x0hat, y, sigma, ratio):
+        x_next = x + step_drift + step_noise
+        if return_stats:
+            return x_next, step_drift.abs().mean().item(), step_noise.abs().mean().item(), cg_drift + cg_noise
+        return x_next
+
+    def sample(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False):
         x = x.detach()
         x0hat = x0hat.detach()
         total_cg_iters = 0
         total_drift = 0.0
         total_noise = 0.0
         for step in range(self.num_steps):
-            x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio)
-            total_drift += d_norm
-            total_noise += n_norm
-            total_cg_iters += cg_iters
+            if return_stats:
+                x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio, return_stats=True)
+                total_drift += d_norm
+                total_noise += n_norm
+                total_cg_iters += cg_iters
+            else:
+                x = self.step(pdaps, x, x0hat, y, sigma, ratio)
             should_check = self.check_finite and (
                 step == self.num_steps - 1 or (step + 1) % self.finite_check_interval == 0
             )
             if should_check and not torch.isfinite(torch.view_as_real(x)).all():
+                if not return_stats:
+                    return torch.zeros_like(x)
                 return torch.zeros_like(x), 0.0, 0.0, 0.0
+        if not return_stats:
+            return x.detach()
         return x.detach(), total_cg_iters / max(1, self.num_steps), total_drift / max(1, self.num_steps), total_noise / max(1, self.num_steps)
 
 
@@ -111,8 +127,16 @@ class PDAPS(Algo):
     def AHA(self, x):
         return mri_AHA(self, x)
 
-    def solve(self, rhs, lam):
-        return conjgrad(self.AHA, rhs, torch.zeros_like(rhs), lam, self.inner.cg_iter, x_is_zero=True)
+    def solve(self, rhs, lam, return_iters=False):
+        return conjgrad(
+            self.AHA,
+            rhs,
+            torch.zeros_like(rhs),
+            lam,
+            self.inner.cg_iter,
+            x_is_zero=True,
+            return_iters=return_iters,
+        )
 
     def residual_norm(self, x, y):
         r = self.A(x) - y
@@ -181,9 +205,15 @@ class PDAPS(Algo):
                 inner_stats = ""
             else:
                 x_init = self.init_inner(x_prev, x0hat, y)
-                x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
-                inner_dist = (x_clean - x0hat).abs().mean().item()
-                inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
+                if self.log_level == "DEBUG":
+                    x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
+                        self, x_init, x0hat, y, sigma, i / max(1, N), return_stats=True
+                    )
+                    inner_dist = (x_clean - x0hat).abs().mean().item()
+                    inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
+                else:
+                    x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
+                    inner_stats = ""
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5 or i >= N - 3:
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "

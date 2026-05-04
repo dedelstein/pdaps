@@ -25,7 +25,7 @@ def _batch_view(x, ref):
     return x.view((x.shape[0],) + (1,) * (ref.ndim - 1))
 
 
-def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
+def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False, return_iters=False):
     """
     Conjugate gradient solver for (A^H A + λI) x = b.
 
@@ -41,14 +41,15 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
         tol: early stopping tolerance on residual norm
         x_is_zero: skip the initial normal_op(x) when x is known to be zero
     Returns:
-        x: solution tensor (complex)
+        x, or (x, num_iters) when return_iters=True.
     """
     # r = b - (A^H A + λI) x
     r = b.clone() if x_is_zero else b - normal_op(x) - lam * x
     p = r.clone()
     rs_old = _batch_inner(r, r)
 
-    for _ in range(max_iter):
+    num_iters = 0
+    for num_iters in range(1, max_iter + 1):
         Ap = normal_op(p) + lam * p            # (A^H A + λI) p
         pAp = _batch_inner(p, Ap)
         active = pAp.abs() >= 1e-30
@@ -66,6 +67,8 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
         p = r + _batch_view(beta, p) * p
         rs_old = rs_new
 
+    if return_iters:
+        return x, num_iters
     return x
 
 
@@ -214,21 +217,18 @@ class pULA(Algo):
         lam = 1.0 / (sigma_max ** 2)
         B, H, W = AHy.shape
 
-        # TODO: draw noise in measurement space and image space (Eq. 10)
-        #   n1 has shape of k-space: (B, num_coils, H, W) complex
-        #   n2 has shape of image:   (B, H, W) complex
-        #   noise_rhs = AH(n1) + (1/sigma_max) * n2
-        n1 = math.sqrt(2.0) * torch.randn(
+        # torch complex randn has Var(real)=Var(imag)=1/2. The outer sqrt(2)
+        # below converts this init step to unit variance per real channel.
+        n1 = torch.randn(
             B,
             *self.forward_op.maps.shape[-3:],
             dtype=self.forward_op.maps.dtype,
             device=device,
         )
-        # TODO: verify n1 shape matches k-space dims — should be (B, C, H, W) complex Gaussian
-        n2 = math.sqrt(2.0) * torch.randn(B, H, W, dtype=torch.cfloat, device=device)
+        n2 = torch.randn(B, H, W, dtype=torch.cfloat, device=device)
         noise_rhs = self.AH(n1) + (1.0 / sigma_max) * n2
 
-        # RHS for CG: AHy + sqrt(2) * noise_rhs  (step=2 in BART)
+        # RHS for CG: AHy + sqrt(2) * noise_rhs (step=2 in BART).
         rhs = AHy + math.sqrt(2.0) * noise_rhs
 
         # Solve (A^H A + λI) x = rhs, starting from zeros
@@ -267,7 +267,8 @@ class pULA(Algo):
 
         # Initialize from posterior with flat prior (Eq. 9)
         x = self.init_sample(AHy, device)
-        print(f"[pULA] after init: x.abs.max={x.abs().max().item():.3e}  AHy.abs.max={AHy.abs().max().item():.3e}")
+        if self.log_level in ["INFO", "DEBUG"]:
+            print(f"[pULA] after init: x.abs.max={x.abs().max().item():.3e}  AHy.abs.max={AHy.abs().max().item():.3e}")
 
         verbose = kwargs.get("verbose", True)
         
@@ -298,6 +299,8 @@ class pULA(Algo):
                 rhs = rhs + step_drift
                 
                 # --- Noise injection (Eq. 10) ---
+                # torch complex randn has half variance per real component, so
+                # sqrt(2) gives the same scale as independent real/imag N(0, 1).
                 B, H, W = x.shape
                 n1 = math.sqrt(2.0) * torch.randn_like(y)                     # (B,C,H,W) complex
                 n2 = math.sqrt(2.0) * torch.randn(B, H, W, dtype=x.dtype, device=device)
@@ -307,7 +310,10 @@ class pULA(Algo):
 
                 # --- CG solve: (A^H A + λI) x_new = rhs ---
                 # warm-started from current x
-                x, cg_iters = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
+                if self.log_level == "DEBUG":
+                    x, cg_iters = conjgrad(self.AHA, rhs, x, lam, self.cg_iter, return_iters=True)
+                else:
+                    x = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5:
                 msg = (f"[pULA] outer={i:3d} σ={sigma:.4f} x.max={x.abs().max().item():.3e} "

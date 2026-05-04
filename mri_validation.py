@@ -280,10 +280,6 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
         row["runtime_s"] = time.perf_counter() - start
         row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
         
-        status_str = "[FAILED]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
-        print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
-              f"{status_str} DataMisfit={row.get('data_misfit', 0.0):.3e} Time={row['runtime_s']:.1f}s")
-
         if save_image and not row["failed"]:
             cfg = OmegaConf.create({
                 "algorithm": {"_target_": entry["algorithm"]["_target_"]},
@@ -301,6 +297,11 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
         row["failed"] = True
         row["error"] = repr(exc)
         row["runtime_s"] = time.perf_counter() - start
+        
+    status_str = f"[FAILED: {row.get('error', 'unknown')}]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
+    print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
+          f"{status_str} DataMisfit={row.get('data_misfit', 0.0):.3e} Time={row['runtime_s']:.1f}s")
+
     return row
 
 
@@ -375,7 +376,7 @@ def parse_args():
     parser.add_argument("--test-slices", type=int, default=3)
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
-    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="INFO")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="VAL")
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep", "iso_nfe", "warm_sweep"),
                         default="tiny")
@@ -441,7 +442,7 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
 
 
 def run_validation(args):
-    entries = method_grid(args.grid_preset)
+    entries = method_grid(args.grid_preset, log_level=args.log_level)
     methods_filter = getattr(args, "methods", None)
     if methods_filter:
         wanted = {m.strip() for m in methods_filter.split(",") if m.strip()}
@@ -505,7 +506,7 @@ def run_from_hydra(cfg):
         list_grid=bool(validation.get("list_grid", False)),
         grid_preset=validation.get("grid_preset", "tiny"),
         methods=validation.get("methods", None),
-        log_level=validation.get("log_level", "INFO"),
+        log_level=validation.get("log_level", "VAL"),
     )
     return run_validation(args)
 
@@ -516,4 +517,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-n()
