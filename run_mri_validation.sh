@@ -21,6 +21,7 @@ set -euo pipefail
 #   warm-sweep     warm_fraction sweep at R=4 and R=8.
 #   iso-nfe        lgvd_num_steps sweep at R=4 and R=8.
 #   inner-sweep    inner_sigma_max sweep at R=4 and R=8.
+#   pdaps-tight    Focused P-DAPS gate/inner-step tuning at R=4.
 #
 # When --filenames is set (multi-file presets like `robust`), --val-slices
 # and --test-slices are interpreted *per file*. Otherwise per-run.
@@ -90,6 +91,10 @@ case "$PRESET" in
     inner-sweep)
         ARGS=(--grid-preset pdaps_inner_sweep --accelerations 4 8)
         DEFAULT_SLICES=(--val-slices 3 --test-slices 5)
+        ;;
+    pdaps-tight)
+        ARGS=(--grid-preset pdaps_tight --acceleration 4)
+        DEFAULT_SLICES=(--val-slices 1 --test-slices 1)
         ;;
     *)
         echo "Unknown preset: $PRESET" >&2

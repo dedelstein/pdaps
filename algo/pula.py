@@ -326,7 +326,7 @@ class pULA(Algo):
                     drift_norm = step_drift.abs().mean().item()
                     noise_norm = step_noise.abs().mean().item()
                     msg += (f" resid={resid:.3e} CG={cg_iters} "
-                            f"drift={drift_norm:.3e} noise={noise_norm:.3e}")
+                            f"rhs_drift={drift_norm:.3e} rhs_noise={noise_norm:.3e}")
                 
                 if self.log_level in ["INFO", "DEBUG"]:
                     if verbose:

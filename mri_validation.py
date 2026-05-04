@@ -93,6 +93,17 @@ def method_grid(preset="tiny", log_level="INFO"):
         pdaps_gammas = [0.5]
         warm_fractions = [0.2]
         pdaps_inner_sigma_maxes = [0.3, 1.0, 5.0, 20.0, 1e9]
+    elif preset == "pdaps_tight":
+        # Tight MRI tuning around the toy-derived gate. The goal is to test
+        # whether delaying the inner correction and keeping it short preserves
+        # detail while retaining data consistency.
+        dps_scales = []
+        daps_lrs = [3e-6]              # one validated DAPS reference
+        pula_gammas = []
+        pdaps_gammas = [0.5]
+        warm_fractions = [0.1, 0.2]
+        pdaps_inner_sigma_maxes = [0.3, 1.0]
+        pdaps_num_steps_list = [5, 10]
     elif preset == "iso_nfe":
         # Hold everything else fixed at validated defaults; sweep
         # lgvd_config.num_steps to test if P-DAPS at iso-NFE matches DAPS.
@@ -193,7 +204,7 @@ def method_grid(preset="tiny", log_level="INFO"):
     return methods
 
 
-PDAPS_INNER_SIGMA_MAX = 5.0
+PDAPS_INNER_SIGMA_MAX = 0.3
 
 
 def pdaps_entry(method, warm_mode, gamma, warm_fraction,
@@ -378,7 +389,8 @@ def parse_args():
     parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="VAL")
     parser.add_argument("--grid-preset",
-                        choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep", "iso_nfe", "warm_sweep"),
+                        choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
+                                 "pdaps_tight", "iso_nfe", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
