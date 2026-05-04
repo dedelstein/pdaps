@@ -144,12 +144,14 @@ class pULA(Algo):
                  noise_scheduler_config,
                  K=4,            # Langevin steps per noise level
                  gamma=0.5,      # fixed step size
-                 cg_iter=10):    # CG iterations for preconditioning
+                 cg_iter=10,     # CG iterations for preconditioning
+                 log_level="INFO"):
         super().__init__(net, forward_op)
         self.noise_scheduler = Scheduler(**noise_scheduler_config)
         self.K = K
         self.gamma = gamma
         self.cg_iter = cg_iter
+        self.log_level = log_level
 
     # -- Complex-domain MRI operators using forward_op internals --
 
@@ -267,9 +269,12 @@ class pULA(Algo):
         x = self.init_sample(AHy, device)
         print(f"[pULA] after init: x.abs.max={x.abs().max().item():.3e}  AHy.abs.max={AHy.abs().max().item():.3e}")
 
+        verbose = kwargs.get("verbose", True)
+        
         # Anneal from sigma_max (sigma_steps[0]) down to sigma_min (sigma_steps[N-1]).
         # Inversebench's Scheduler stores sigma_steps in decreasing order, so iterate i=0..N-1.
-        pbar = tqdm(range(N), desc='pULA')
+        disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
+        pbar = tqdm(range(N), desc='pULA', disable=disable_tqdm)
 
         for i in pbar:
             sigma = sigmas[i].item()
@@ -288,25 +293,43 @@ class pULA(Algo):
                 # Implicit form: solve (AHA + λI) x_new = rhs where
                 #   rhs = (AHA + λI)x + (γ/2)(lik + score) + sqrt(γ)·(AH(n1) + sqrt(λ)·n2)
                 rhs = AHAx + lam * x                              # (A^H A + λI) x
-                rhs = rhs + (self.gamma / 2.0) * likelihood_grad  # + (γ/2) * A^H(y - Ax)
-                rhs = rhs + (self.gamma / 2.0) * s                # + (γ/2) * prior score
-
+                
+                step_drift = (self.gamma / 2.0) * (likelihood_grad + s)
+                rhs = rhs + step_drift
+                
                 # --- Noise injection (Eq. 10) ---
-                # TODO: draw n1 ~ CN(0, I) in k-space shape, n2 ~ CN(0, I) in image shape
-                # TODO: rhs += sqrt(γ) * AH(n1) + sqrt(γ * λ) * n2
                 B, H, W = x.shape
                 n1 = math.sqrt(2.0) * torch.randn_like(y)                     # (B,C,H,W) complex
                 n2 = math.sqrt(2.0) * torch.randn(B, H, W, dtype=x.dtype, device=device)
-                rhs = rhs + math.sqrt(self.gamma) * self.AH(n1)
-                rhs = rhs + math.sqrt(self.gamma * lam) * n2
+                step_noise = math.sqrt(self.gamma) * self.AH(n1) + math.sqrt(self.gamma * lam) * n2
+                
+                rhs = rhs + step_noise
 
                 # --- CG solve: (A^H A + λI) x_new = rhs ---
                 # warm-started from current x
-                x = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
+                x, cg_iters = conjgrad(self.AHA, rhs, x, lam, self.cg_iter)
 
-            if i % 20 == 0 or i < 5:
-                tqdm.write(f"[pULA] outer={i:3d} σ={sigma:.4f} x.abs.max={x.abs().max().item():.3e} s.abs.max={s.abs().max().item():.3e}")
-            pbar.set_description(f'pULA σ={sigma:.4f}')
+            if self.log_level == "DEBUG" or i % 20 == 0 or i < 5:
+                # Residual: ||A(x) - y||_2
+                Ax = self.A(x)
+                m = max(1.0, float(self.forward_op.mask.expand_as(y[:1]).sum().item()))
+                resid = (Ax - y).abs().square().flatten(start_dim=1).sum(dim=1).sqrt().mean().item() / math.sqrt(m)
+                
+                msg = (f"[pULA] outer={i:3d} σ={sigma:.4f} x.max={x.abs().max().item():.3e} "
+                       f"s.max={s.abs().max().item():.3e} resid={resid:.3e}")
+                if self.log_level == "DEBUG":
+                    drift_norm = step_drift.abs().mean().item()
+                    noise_norm = step_noise.abs().mean().item()
+                    msg += f" CG_iters={cg_iters} drift={drift_norm:.3e} noise={noise_norm:.3e}"
+                
+                if self.log_level in ["INFO", "DEBUG"]:
+                    if verbose:
+                        tqdm.write(msg)
+                    else:
+                        print(msg)
+                        
+            if not disable_tqdm:
+                pbar.set_description(f'pULA σ={sigma:.4f}')
 
         # Convert back to 2-channel real (B,2,H,W) for InverseBench evaluator
         return self.to_real(x).float()

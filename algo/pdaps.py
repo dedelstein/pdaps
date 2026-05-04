@@ -37,25 +37,34 @@ class MRIInnerPULA:
 
         score_lik = pdaps.AH(y - pdaps.A(x))
         score_prior = -(x - x0hat) * lam
-        drift = pdaps.solve(score_lik + score_prior, lam)
+        drift, cg_drift = pdaps.solve(score_lik + score_prior, lam)
 
         n1 = math.sqrt(2.0) * torch.randn_like(y)
         n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-        noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam)
+        noise, cg_noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam)
 
-        return x + 0.5 * gamma * drift + math.sqrt(gamma) * noise
+        step_drift = 0.5 * gamma * drift
+        step_noise = math.sqrt(gamma) * noise
+        
+        return x + step_drift + step_noise, step_drift.abs().mean().item(), step_noise.abs().mean().item(), cg_drift + cg_noise
 
     def sample(self, pdaps, x, x0hat, y, sigma, ratio):
         x = x.detach()
         x0hat = x0hat.detach()
+        total_cg_iters = 0
+        total_drift = 0.0
+        total_noise = 0.0
         for step in range(self.num_steps):
-            x = self.step(pdaps, x, x0hat, y, sigma, ratio)
+            x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio)
+            total_drift += d_norm
+            total_noise += n_norm
+            total_cg_iters += cg_iters
             should_check = self.check_finite and (
                 step == self.num_steps - 1 or (step + 1) % self.finite_check_interval == 0
             )
             if should_check and not torch.isfinite(torch.view_as_real(x)).all():
-                return torch.zeros_like(x)
-        return x.detach()
+                return torch.zeros_like(x), 0.0, 0.0, 0.0
+        return x.detach(), total_cg_iters / max(1, self.num_steps), total_drift / max(1, self.num_steps), total_noise / max(1, self.num_steps)
 
 
 class PDAPS(Algo):
@@ -156,25 +165,38 @@ class PDAPS(Algo):
         x_prev = None
         self.last_gate_stats = []
         N = self.annealing.num_steps
-        print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}")
-        steps = tqdm.trange(N, desc="P-DAPS") if verbose else range(N)
+        if self.log_level in ["INFO", "DEBUG"]:
+            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}")
+        
+        disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
+        steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
         for i in steps:
             sigma = self.annealing.sigma_steps[i]
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
             if sigma > self.inner_sigma_max:
                 x_clean = x0hat
+                inner_stats = ""
             else:
                 x_init = self.init_inner(x_prev, x0hat, y)
-                x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
-            if i % 20 == 0 or i < 5 or i >= N - 3:
-                msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
-                       f"x0hat.abs.max={x0hat.abs().max().item():.3e} "
-                       f"x_clean.abs.max={x_clean.abs().max().item():.3e}")
-                if verbose:
-                    tqdm.tqdm.write(msg)
+                x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
+                inner_dist = (x_clean - x0hat).abs().mean().item()
+                if self.log_level == "DEBUG":
+                    inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
                 else:
-                    print(msg)
+                    inner_stats = ""
+
+            if self.log_level == "DEBUG" or i % 20 == 0 or i < 5 or i >= N - 3:
+                resid = self.residual_norm(x_clean, y).mean().item()
+                msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
+                       f"x0hat.max={x0hat.abs().max().item():.3e} "
+                       f"x_clean.max={x_clean.abs().max().item():.3e} "
+                       f"resid={resid:.3e}{inner_stats}")
+                if self.log_level in ["INFO", "DEBUG"]:
+                    if verbose:
+                        tqdm.tqdm.write(msg)
+                    else:
+                        print(msg)
             x_prev = x_clean
             xt = self.to_real(x_clean + torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1])
 
