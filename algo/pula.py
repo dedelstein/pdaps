@@ -12,6 +12,19 @@ from utils.scheduler import Scheduler
 # -----------------------------------------------------------------------------------------------
 
 
+def _batch_inner(x, y):
+    inner = (x.conj() * y).real
+    if inner.ndim <= 1:
+        return inner.sum()
+    return inner.flatten(start_dim=1).sum(dim=1)
+
+
+def _batch_view(x, ref):
+    if x.ndim == 0:
+        return x
+    return x.view((x.shape[0],) + (1,) * (ref.ndim - 1))
+
+
 def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
     """
     Conjugate gradient solver for (A^H A + λI) x = b.
@@ -33,20 +46,24 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False):
     # r = b - (A^H A + λI) x
     r = b.clone() if x_is_zero else b - normal_op(x) - lam * x
     p = r.clone()
-    rs_old = torch.sum(r.conj() * r).real
+    rs_old = _batch_inner(r, r)
 
     for _ in range(max_iter):
         Ap = normal_op(p) + lam * p            # (A^H A + λI) p
-        pAp = torch.sum(p.conj() * Ap).real
-        if pAp.abs() < 1e-30:
+        pAp = _batch_inner(p, Ap)
+        active = pAp.abs() >= 1e-30
+        if not active.any():
             break
-        alpha = rs_old / pAp
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rs_new = torch.sum(r.conj() * r).real
-        if rs_new.sqrt() < tol:
+        denom = torch.where(active, pAp, torch.ones_like(pAp))
+        alpha = torch.where(active, rs_old / denom, torch.zeros_like(pAp))
+        alpha_view = _batch_view(alpha, p)
+        x = x + alpha_view * p
+        r = r - alpha_view * Ap
+        rs_new = _batch_inner(r, r)
+        if (rs_new.sqrt() < tol).all():
             break
-        p = r + (rs_new / rs_old) * p
+        beta = rs_new / rs_old.clamp_min(1e-30)
+        p = r + _batch_view(beta, p) * p
         rs_old = rs_new
 
     return x
@@ -81,29 +98,6 @@ def _mri_fft_cache(algo):
     return algo._mri_even_shape, algo._mri_maps_shift, algo._mri_maps_shift_conj, algo._mri_mask_unshift
 
 
-def _centered_fft(x, dim):
-    return torch.fft.ifftshift(
-        torch.fft.fft(torch.fft.fftshift(x, dim=dim), dim=dim, norm="ortho"),
-        dim=dim,
-    )
-
-
-def _centered_ifft(x, dim):
-    return torch.fft.fftshift(
-        torch.fft.ifft(torch.fft.ifftshift(x, dim=dim), dim=dim, norm="ortho"),
-        dim=dim,
-    )
-
-
-def _mri_cartesian_mask_dim(algo):
-    mask = algo.forward_op.mask
-    if mask.shape[-2] == 1 and mask.shape[-1] > 1:
-        return -1
-    if mask.shape[-1] == 1 and mask.shape[-2] > 1:
-        return -2
-    return None
-
-
 def mri_A(algo, x):
     even_shape, maps_shift, _, mask_unshift = _mri_fft_cache(algo)
     if not even_shape:
@@ -127,12 +121,6 @@ def mri_AH(algo, y):
 
 def mri_AHA(algo, x):
     even_shape, maps_shift, maps_shift_conj, mask_unshift = _mri_fft_cache(algo)
-    mask_dim = _mri_cartesian_mask_dim(algo)
-    if getattr(algo, "use_fast_aha", True) and even_shape and mask_dim is not None:
-        coils = algo.forward_op.maps * x.unsqueeze(1)
-        masked = algo.forward_op.mask * _centered_fft(coils, dim=mask_dim)
-        return (_centered_ifft(masked, dim=mask_dim) * algo.forward_op.maps.conj()).sum(dim=1)
-
     if not even_shape:
         return mri_AH(algo, mri_A(algo, x))
 
@@ -155,14 +143,12 @@ class pULA(Algo):
                  noise_scheduler_config,
                  K=4,            # Langevin steps per noise level
                  gamma=0.5,      # fixed step size
-                 cg_iter=10,     # CG iterations for preconditioning
-                 use_fast_aha=True):
+                 cg_iter=10):    # CG iterations for preconditioning
         super().__init__(net, forward_op)
         self.noise_scheduler = Scheduler(**noise_scheduler_config)
         self.K = K
         self.gamma = gamma
         self.cg_iter = cg_iter
-        self.use_fast_aha = bool(use_fast_aha)
 
     # -- Complex-domain MRI operators using forward_op internals --
 
@@ -229,7 +215,12 @@ class pULA(Algo):
         #   n1 has shape of k-space: (B, num_coils, H, W) complex
         #   n2 has shape of image:   (B, H, W) complex
         #   noise_rhs = AH(n1) + (1/sigma_max) * n2
-        n1 = torch.randn_like(self.forward_op.maps).expand(B, -1, -1, -1)
+        n1 = torch.randn(
+            B,
+            *self.forward_op.maps.shape[-3:],
+            dtype=self.forward_op.maps.dtype,
+            device=device,
+        )
         # TODO: verify n1 shape matches k-space dims — should be (B, C, H, W) complex Gaussian
         n2 = torch.randn(B, H, W, dtype=torch.cfloat, device=device)
         noise_rhs = self.AH(n1) + (1.0 / sigma_max) * n2

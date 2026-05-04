@@ -70,7 +70,6 @@ class PDAPS(Algo):
         warm_fraction=0.0,
         inner_sigma_max=float("inf"),
         eps=1e-8,
-        use_fast_aha=True,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -82,7 +81,6 @@ class PDAPS(Algo):
         self.warm_fraction = float(warm_fraction)
         self.inner_sigma_max = float(inner_sigma_max)
         self.eps = float(eps)
-        self.use_fast_aha = bool(use_fast_aha)
         self.last_gate_stats = []
 
     @staticmethod
