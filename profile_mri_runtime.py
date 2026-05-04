@@ -46,7 +46,6 @@ def parse_args():
     parser.add_argument("--inner-steps", type=int, default=None)
     parser.add_argument("--pula-k", type=int, default=None)
     parser.add_argument("--cg-iter", type=int, default=None)
-    parser.add_argument("--no-fast-aha", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--compile-net", action="store_true")
     parser.add_argument("--compile-mode", default="reduce-overhead")
@@ -102,8 +101,6 @@ def override_steps(entry, args):
             algorithm["lgvd_config"]["cg_iter"] = args.cg_iter
         if "cg_iter" in algorithm:
             algorithm["cg_iter"] = args.cg_iter
-    if args.no_fast_aha:
-        algorithm["use_fast_aha"] = False
     return entry
 
 
