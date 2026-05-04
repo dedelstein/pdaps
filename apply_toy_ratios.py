@@ -1,22 +1,43 @@
 #!/usr/bin/env python3
-"""Translate toy-study sweep outputs into a fastMRI algorithm config.
+"""Overlay dimensionless toy-study ratios onto a fastMRI algorithm config.
 
-Reads the CSVs produced by toy_sweeps.py, extracts:
-  - optimal warm-start fraction alpha (from study1_cond_alpha)
-  - QUALITATIVE stability finding: DAPS has a measured breakdown step
-    (from daps_breakdown.csv if present, else study4_stability.csv);
-    P-DAPS shows no divergence across the tested step range
-    (from study4_stability)
-  - efficiency multiplier = DAPS nfe_to_converge / P-DAPS nfe_to_converge
-  - score-bias sensitivity knee (from study2_alpha_score_bias, if present)
-and writes a YAML config that overlays a fastMRI DAPS template with the
-P-DAPS-warm priors. Absolute step sizes do not transfer across problem
-scales; the qualitative stability finding is recorded in provenance only,
-and the template's fastMRI lr is NOT scaled by a toy-derived ratio (the
-old "stability ratio" was grid-censored on both ends and meaningless).
+Scope (deliberately narrow): only quantities that are dimensionless or
+ratio-based transfer cleanly from the 2D toy to multi-coil MRI. This script
+extracts and applies exactly those.
 
-Precondition: study1/study4 inputs are the VE-only toy_b formal-study CSVs.
-SDE robustness and Toy D studies intentionally write separate CSV schemas.
+Transferred (overlaid onto the MRI YAML):
+  - warm-start fraction alpha — dimensionless mixing weight in
+    x_init = alpha*x_prev + (1-alpha)*x0_hat. The toy's safe band for
+    alpha is a defensible starting point for MRI.
+  - efficiency multiplier = DAPS_nfe_to_converge / P-DAPS_nfe_to_converge.
+    Method-vs-method ratio on the same problem; used to scale the
+    template's `lgvd_config.num_steps` (inner Langevin step count).
+
+NOT transferred (left at MRI-tuned values):
+  - Absolute step sizes (gamma, lr): operator scale, noise level, and
+    network conditioning differ between toy and MRI. The toy's
+    gamma=0.5 working is not evidence MRI gamma=0.5 works.
+  - Schedule extents (sigma_max, sigma_min): tied to the EDM training
+    distribution and data scale.
+  - inner_sigma_max gating threshold: the theoretical bound
+    1/sqrt(N*gamma) predicts the right order of magnitude on both toy
+    and MRI, but the empirical optima differ (~0.2 toy, ~5 MRI) because
+    MRI's outer reverse-ODE has more contractive headroom. Set by MRI
+    sweep, not by the toy.
+
+Recorded in provenance only (not written into the YAML):
+  - Stability finding: DAPS breakdown step (from daps_breakdown.csv if
+    present, else study4_stability.csv); P-DAPS shows no divergence
+    across the tested step range (study4_stability).
+  - Score-bias sensitivity knee (study2_alpha_score_bias, if present).
+  - Adaptive-vs-fixed warm-start gate finding.
+
+These are qualitative thesis-paragraph fodder; they do NOT modify the
+output YAML.
+
+Inputs: VE-only toy_b formal-study CSVs produced by toy_sweeps.py.
+Output: a fastMRI YAML with two fields overlaid (warm_fraction and
+        lgvd_config.num_steps) plus a `_extraction_provenance` block.
 """
 import argparse
 import json
@@ -25,7 +46,6 @@ from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
-import yaml
 
 P_DAPS_WARM_ALPHA_PREFIX = "P-DAPS-warm alpha="
 P_DAPS_ADAPTIVE = "P-DAPS-adaptive"
@@ -276,78 +296,112 @@ def extract_adaptive_vs_fixed(adaptive_df, tolerance=1.05, warm_mode="fixed"):
     return {"status": "ok", "warm_mode": warm_mode, "scenarios": scenarios}
 
 
-def build_config(template_path, alpha_info, stability_info, efficiency_info, bias_info,
-                 adaptive_info=None, warm_mode="fixed"):
-    with open(template_path) as f:
-        cfg = yaml.safe_load(f)
+def build_report(alpha_info, stability_info, efficiency_info, bias_info, adaptive_info):
+    """Compose the toy-derived ratios + qualitative findings into a thesis-ready report."""
+    alpha_status = alpha_info.get("status")
+    alpha_value = None
+    if alpha_status in ("ok", "baseline_unreached"):
+        alpha_value = float(alpha_info["safe_mri_alpha"])
 
-    if warm_mode == "adaptive":
-        cfg["algorithm"]["_target_"] = "algo.pdaps.PDAPSAdaptive"
-        cfg["algorithm"]["warm_mode"] = "adaptive"
+    eff_status = efficiency_info.get("status")
+    eff_multiplier = None
+    daps_nfe = pdaps_nfe = None
+    if eff_status == "ok":
+        eff_multiplier = float(efficiency_info["efficiency_multiplier"])
+        daps_nfe = float(efficiency_info["daps_nfe_to_converge"])
+        pdaps_nfe = float(efficiency_info["pdaps_nfe_to_converge"])
+
+    suggested_inner_steps = None
+    if eff_multiplier and eff_multiplier > 1.0:
+        suggested_inner_steps = max(5, int(round(100 / eff_multiplier)))
+
+    return OrderedDict([
+        ("transferable", OrderedDict([
+            ("warm_fraction", OrderedDict([
+                ("value", alpha_value),
+                ("source", "study1_cond_alpha.csv"),
+                ("status", alpha_status),
+                ("note", "Dimensionless mixing weight; safe band for MRI starting point."),
+            ])),
+            ("lgvd_num_steps", OrderedDict([
+                ("efficiency_multiplier", eff_multiplier),
+                ("daps_nfe_to_converge", daps_nfe),
+                ("pdaps_nfe_to_converge", pdaps_nfe),
+                ("suggested_value_at_template_100", suggested_inner_steps),
+                ("source", "study1_cond_alpha.csv (NFE-to-converge)"),
+                ("status", eff_status),
+                ("note", "Method-vs-method ratio; divide MRI template's "
+                         "lgvd_config.num_steps by this multiplier."),
+            ])),
+        ])),
+        ("qualitative_findings", OrderedDict([
+            ("stability", stability_info),
+            ("score_bias", bias_info),
+            ("adaptive_vs_fixed", adaptive_info),
+        ])),
+        ("not_transferred", [
+            "Absolute step sizes (gamma, lr) — operator scale and EDM training distribution differ.",
+            "Schedule extents (sigma_max, sigma_min) — tied to data scale.",
+            "inner_sigma_max gating threshold — theory predicts the right order, "
+            "empirical optima differ between toy and MRI; tune on MRI.",
+        ]),
+    ])
+
+
+def render_markdown(report):
+    """Render the report as a small markdown table for the thesis appendix."""
+    lines = []
+    lines.append("# Toy-derived ratios for fastMRI transfer\n")
+    lines.append("Auto-generated by `apply_toy_ratios.py` from `toy_sweeps.py` outputs.\n")
+    lines.append("This file is for citation; it does NOT drive `mri_validation.py`. ")
+    lines.append("The MRI validation grid is hand-curated and centered on these values.\n\n")
+
+    lines.append("## Transferable\n\n")
+    lines.append("| Quantity | Toy-derived value | MRI use |\n")
+    lines.append("|---|---|---|\n")
+    wf = report["transferable"]["warm_fraction"]
+    inner = report["transferable"]["lgvd_num_steps"]
+    wf_val = "(unavailable)" if wf["value"] is None else f"{wf['value']:.3f}"
+    mult = inner["efficiency_multiplier"]
+    suggested = inner["suggested_value_at_template_100"]
+    if mult is None:
+        inner_cell = "(efficiency multiplier unavailable)"
+    elif suggested is None:
+        inner_cell = f"(multiplier {mult:.2f} ≤ 1.0; toy does not motivate reducing num_steps)"
     else:
-        cfg["algorithm"]["_target_"] = "algo.pdaps.PDAPSWarm"
-        cfg["algorithm"]["warm_mode"] = "fixed"
+        inner_cell = f"{suggested} (template 100 / multiplier {mult:.2f})"
+    lines.append(f"| `warm_fraction` (alpha) | {wf_val} | "
+                 f"Center of the validation sweep over warm_fractions. |\n")
+    lines.append(f"| `lgvd_config.num_steps` | {inner_cell} | "
+                 f"Inner Langevin step count in the validation grid. |\n\n")
 
-    alpha = None
-    if alpha_info.get("status") == "ok":
-        alpha = alpha_info["safe_mri_alpha"]
-    elif alpha_info.get("status") == "baseline_unreached":
-        alpha = alpha_info["safe_mri_alpha"]
-    if alpha is not None:
-        cfg["algorithm"]["warm_fraction"] = float(alpha)
+    lines.append("## Qualitative findings (recorded only)\n\n")
+    for name, info in report["qualitative_findings"].items():
+        lines.append(f"- **{name}**: status `{info.get('status', 'unknown')}`\n")
 
-    lgvd = cfg["algorithm"].setdefault("lgvd_config", {})
-    # We deliberately do NOT scale the template's Langevin lr by a toy-derived
-    # ratio. The previous "stability ratio" was a grid artefact (both endpoints
-    # censored). The qualitative stability finding lives in
-    # _extraction_provenance.stability instead.
+    lines.append("\n## Deliberately not transferred\n\n")
+    for reason in report["not_transferred"]:
+        lines.append(f"- {reason}\n")
 
-    if efficiency_info.get("status") == "ok":
-        mult = efficiency_info["efficiency_multiplier"]
-        if mult > 1.0:
-            current_inner = int(lgvd.get("num_steps", 100))
-            reduced = max(5, int(round(current_inner / mult)))
-            lgvd["num_steps"] = reduced
-            lgvd["_num_steps_scaling_note"] = (
-                f"divided template lgvd_config.num_steps by efficiency multiplier {mult:.2f}"
-                f" (DAPS nfe_to_converge {efficiency_info['daps_nfe_to_converge']:.0f},"
-                f" P-DAPS nfe_to_converge {efficiency_info['pdaps_nfe_to_converge']:.0f})"
-            )
-
-    cfg["_extraction_provenance"] = {
-        "alpha": alpha_info,
-        "stability": stability_info,
-        "efficiency": efficiency_info,
-        "score_bias": bias_info,
-        "adaptive_vs_fixed": adaptive_info or {"status": "missing", "warm_mode": warm_mode},
-    }
-    return cfg
-
-
-def write_config(cfg, out_path):
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    header = (
-        "# AUTO-GENERATED by extract_mri_priors.py\n"
-        "# Do not edit by hand; rerun the toy sweep if you want to refresh.\n"
-    )
-    with open(out_path, "w") as f:
-        f.write(header)
-        yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+    return "".join(lines)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results-dir", required=True,
                    help="Directory containing study1_*.csv etc. produced by toy_sweeps.py")
-    p.add_argument("--template", default="configs/daps_config.yaml",
-                   help="Base fastMRI config to overlay")
-    p.add_argument("--out-file", default="configs/fastmri_auto_prior.yaml")
+    p.add_argument("--out-file", default=None,
+                   help="JSON output path. Defaults to <results-dir>/toy_ratios.json. "
+                        "A companion .md file is always written alongside it.")
+    # Legacy --template arg silently accepted to avoid breaking older invocations,
+    # but no longer used (we no longer overlay onto a fastMRI YAML).
+    p.add_argument("--template", default=None, help=argparse.SUPPRESS)
     p.add_argument("--tolerance", type=float, default=1.05,
                    help="Allowed fit-error slack vs DAPS baseline when picking alpha")
     p.add_argument("--safety-buffer", type=float, default=0.10,
                    help="Additive buffer on alpha for MRI transfer")
     p.add_argument("--warm-mode", choices=("fixed", "adaptive"), default="fixed",
-                   help="MRI warm-start mode to write into the generated config")
+                   help="Affects the adaptive-vs-fixed provenance only")
     args = p.parse_args()
 
     study1 = _read_csv(os.path.join(args.results_dir, "study1_cond_alpha.csv"))
@@ -367,32 +421,18 @@ def main():
         warm_mode=args.warm_mode,
     )
 
-    summary = OrderedDict([
-        ("alpha", alpha_info),
-        ("stability", stability_info),
-        ("efficiency", efficiency_info),
-        ("score_bias", bias_info),
-        ("adaptive_vs_fixed", adaptive_info),
-    ])
-    print(json.dumps(summary, indent=2, default=str))
+    report = build_report(alpha_info, stability_info, efficiency_info, bias_info, adaptive_info)
+    print(json.dumps(report, indent=2, default=str))
 
-    if not os.path.exists(args.template):
-        print(f"[extract_mri_priors] template {args.template} missing; writing summary only")
-        with open(os.path.join(args.results_dir, "mri_priors_summary.json"), "w") as f:
-            json.dump(summary, f, indent=2, default=str)
-        return
-
-    cfg = build_config(
-        args.template,
-        alpha_info,
-        stability_info,
-        efficiency_info,
-        bias_info,
-        adaptive_info=adaptive_info,
-        warm_mode=args.warm_mode,
-    )
-    write_config(cfg, args.out_file)
-    print(f"[extract_mri_priors] wrote {args.out_file}")
+    out_json = args.out_file or os.path.join(args.results_dir, "toy_ratios.json")
+    out_md = os.path.splitext(out_json)[0] + ".md"
+    os.makedirs(os.path.dirname(os.path.abspath(out_json)) or ".", exist_ok=True)
+    with open(out_json, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    with open(out_md, "w") as f:
+        f.write(render_markdown(report))
+    print(f"[apply_toy_ratios] wrote {out_json}")
+    print(f"[apply_toy_ratios] wrote {out_md}")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ def grid(points):
 
 
 def method_grid(preset="tiny"):
+    pdaps_num_steps_list = [25]   # default unless preset overrides
     if preset == "smoke":
         dps_scales = [1.0]
         daps_lrs = [1e-5]
@@ -91,6 +92,26 @@ def method_grid(preset="tiny"):
         pdaps_gammas = [0.5]
         warm_fractions = [0.2]
         pdaps_inner_sigma_maxes = [0.3, 1.0, 5.0, 20.0, 1e9]
+    elif preset == "iso_nfe":
+        # Hold everything else fixed at validated defaults; sweep
+        # lgvd_config.num_steps to test if P-DAPS at iso-NFE matches DAPS.
+        dps_scales = []
+        daps_lrs = [3e-6]              # selected DAPS lr from tiny
+        pula_gammas = []
+        pdaps_gammas = [0.5]
+        warm_fractions = [0.2]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
+        pdaps_num_steps_list = [25, 50, 100]
+    elif preset == "warm_sweep":
+        # Hold everything else at validated defaults; sweep warm_fraction.
+        # Toy's safe band is ~[0.1, 0.3]; we span a wider range to verify
+        # the band transfers (or doesn't) to multi-coil MRI.
+        dps_scales = []
+        daps_lrs = []
+        pula_gammas = []
+        pdaps_gammas = [0.5]
+        warm_fractions = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7]
+        pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
     elif preset == "tiny":
         dps_scales = [0.5, 1.0, 2.0]
         daps_lrs = [3e-6, 1e-5, 3e-5]
@@ -145,27 +166,37 @@ def method_grid(preset="tiny"):
             },
         })
 
-    for p in grid({"gamma": pdaps_gammas, "inner_sigma_max": pdaps_inner_sigma_maxes}):
-        methods.append(pdaps_entry("P-DAPS", "none", p["gamma"], 0.0, p["inner_sigma_max"]))
+    for p in grid({"gamma": pdaps_gammas, "inner_sigma_max": pdaps_inner_sigma_maxes,
+                   "lgvd_num_steps": pdaps_num_steps_list}):
+        methods.append(pdaps_entry("P-DAPS", "none", p["gamma"], 0.0,
+                                   p["inner_sigma_max"], p["lgvd_num_steps"]))
 
-    for p in grid({"gamma": pdaps_gammas, "warm_fraction": warm_fractions, "inner_sigma_max": pdaps_inner_sigma_maxes}):
-        methods.append(pdaps_entry("P-DAPS-fixed", "fixed", p["gamma"], p["warm_fraction"], p["inner_sigma_max"]))
+    for p in grid({"gamma": pdaps_gammas, "warm_fraction": warm_fractions,
+                   "inner_sigma_max": pdaps_inner_sigma_maxes,
+                   "lgvd_num_steps": pdaps_num_steps_list}):
+        methods.append(pdaps_entry("P-DAPS-fixed", "fixed", p["gamma"], p["warm_fraction"],
+                                   p["inner_sigma_max"], p["lgvd_num_steps"]))
     return methods
 
 
 PDAPS_INNER_SIGMA_MAX = 5.0
 
 
-def pdaps_entry(method, warm_mode, gamma, warm_fraction, inner_sigma_max=PDAPS_INNER_SIGMA_MAX):
+def pdaps_entry(method, warm_mode, gamma, warm_fraction,
+                inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     return {
         "method": method,
-        "params": {"gamma": gamma, "warm_fraction": warm_fraction, "inner_sigma_max": inner_str},
+        "params": {
+            "gamma": gamma, "warm_fraction": warm_fraction,
+            "inner_sigma_max": inner_str, "lgvd_num_steps": int(lgvd_num_steps),
+        },
         "algorithm": {
             "_target_": "algo.pdaps.PDAPS",
             "annealing_scheduler_config": ANNEALING,
             "diffusion_scheduler_config": REVERSE_ODE,
-            "lgvd_config": {"num_steps": 25, "gamma": gamma, "cg_iter": 10, "lr_min_ratio": 0.01},
+            "lgvd_config": {"num_steps": int(lgvd_num_steps), "gamma": gamma,
+                            "cg_iter": 10, "lr_min_ratio": 0.01},
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
             "inner_sigma_max": inner_sigma_max,
