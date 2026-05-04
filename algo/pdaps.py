@@ -230,7 +230,9 @@ class PDAPS(Algo):
                     else:
                         print(msg)
             x_prev = x_clean
-            xt = self.to_real(x_clean + torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1])
+            xt = self.to_real(
+                x_clean + math.sqrt(2.0) * torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1]
+            )
 
         return xt.float()
 
