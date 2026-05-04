@@ -216,14 +216,14 @@ class pULA(Algo):
         #   n1 has shape of k-space: (B, num_coils, H, W) complex
         #   n2 has shape of image:   (B, H, W) complex
         #   noise_rhs = AH(n1) + (1/sigma_max) * n2
-        n1 = torch.randn(
+        n1 = math.sqrt(2.0) * torch.randn(
             B,
             *self.forward_op.maps.shape[-3:],
             dtype=self.forward_op.maps.dtype,
             device=device,
         )
         # TODO: verify n1 shape matches k-space dims — should be (B, C, H, W) complex Gaussian
-        n2 = torch.randn(B, H, W, dtype=torch.cfloat, device=device)
+        n2 = math.sqrt(2.0) * torch.randn(B, H, W, dtype=torch.cfloat, device=device)
         noise_rhs = self.AH(n1) + (1.0 / sigma_max) * n2
 
         # RHS for CG: AHy + sqrt(2) * noise_rhs  (step=2 in BART)
@@ -295,8 +295,8 @@ class pULA(Algo):
                 # TODO: draw n1 ~ CN(0, I) in k-space shape, n2 ~ CN(0, I) in image shape
                 # TODO: rhs += sqrt(γ) * AH(n1) + sqrt(γ * λ) * n2
                 B, H, W = x.shape
-                n1 = torch.randn_like(y)                     # (B,C,H,W) complex
-                n2 = torch.randn(B, H, W, dtype=x.dtype, device=device)
+                n1 = math.sqrt(2.0) * torch.randn_like(y)                     # (B,C,H,W) complex
+                n2 = math.sqrt(2.0) * torch.randn(B, H, W, dtype=x.dtype, device=device)
                 rhs = rhs + math.sqrt(self.gamma) * self.AH(n1)
                 rhs = rhs + math.sqrt(self.gamma * lam) * n2
 

@@ -39,8 +39,8 @@ class MRIInnerPULA:
         score_prior = -(x - x0hat) * lam
         drift = pdaps.solve(score_lik + score_prior, lam)
 
-        n1 = torch.randn_like(y)
-        n2 = torch.randn(x.shape, dtype=x.dtype, device=x.device)
+        n1 = math.sqrt(2.0) * torch.randn_like(y)
+        n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
         noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam)
 
         return x + 0.5 * gamma * drift + math.sqrt(gamma) * noise
