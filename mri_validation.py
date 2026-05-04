@@ -2,6 +2,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import os
 import sys
 import time
@@ -268,10 +269,15 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
         recon = algo.inference(observation, num_samples=1, verbose=args.verbose)
         if device.type == "cuda":
             torch.cuda.synchronize()
-        row.update(compute_metrics_dict(forward_op, recon, target, observation))
+        metrics = compute_metrics_dict(forward_op, recon, target, observation)
+        row.update(metrics)
+        metric_names = ("psnr", "ssim", "nmse", "data_misfit", "data_misfit_per_observed")
+        if not metrics.get("finite", False) or not all(math.isfinite(float(metrics[name])) for name in metric_names):
+            row["failed"] = True
+            row["error"] = "nonfinite_reconstruction_or_metrics"
         row["runtime_s"] = time.perf_counter() - start
         row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
-        if save_image:
+        if save_image and not row["failed"]:
             cfg = OmegaConf.create({
                 "algorithm": {"_target_": entry["algorithm"]["_target_"]},
                 "forward_op": {"acceleration_ratio": args.acceleration},

@@ -165,6 +165,10 @@ def profiler_activities(device):
     return activities
 
 
+def gib(num_bytes):
+    return num_bytes / (1024 ** 3)
+
+
 def run_profile(args):
     if args.matmul_precision is not None:
         torch.set_float32_matmul_precision(args.matmul_precision)
@@ -207,6 +211,8 @@ def run_profile(args):
     stats = instrument_algo(algo, args.sync_method_timing)
 
     synchronize_if_needed(device, True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     start = time.perf_counter()
     if args.torch_profiler:
         sort_by = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
@@ -231,6 +237,14 @@ def run_profile(args):
 
     print_method_stats(stats)
     print(f"\nTotal inference wall time: {elapsed:.3f}s")
+    if device.type == "cuda":
+        print(
+            "CUDA memory: "
+            f"current_allocated={gib(torch.cuda.memory_allocated(device)):.2f} GiB  "
+            f"peak_allocated={gib(torch.cuda.max_memory_allocated(device)):.2f} GiB  "
+            f"current_reserved={gib(torch.cuda.memory_reserved(device)):.2f} GiB  "
+            f"peak_reserved={gib(torch.cuda.max_memory_reserved(device)):.2f} GiB"
+        )
     print(f"Output: shape={tuple(recon.shape)} dtype={recon.dtype} device={recon.device}")
 
 

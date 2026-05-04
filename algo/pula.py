@@ -110,11 +110,12 @@ def mri_A(algo, x):
 
 
 def mri_AH(algo, y):
-    even_shape, maps_shift, maps_shift_conj, _ = _mri_fft_cache(algo)
+    even_shape, maps_shift, maps_shift_conj, mask_unshift = _mri_fft_cache(algo)
     if not even_shape:
-        return (algo.forward_op.ifft(y) * algo.forward_op.maps.conj()).sum(dim=1)
+        return (algo.forward_op.ifft(algo.forward_op.mask * y) * algo.forward_op.maps.conj()).sum(dim=1)
 
     y_unshift = torch.fft.ifftshift(y, dim=(-2, -1))
+    y_unshift = mask_unshift * y_unshift
     image_shift = torch.fft.ifft2(y_unshift, dim=(-2, -1), norm="ortho")
     return torch.fft.fftshift((image_shift * maps_shift_conj).sum(dim=1), dim=(-2, -1))
 
