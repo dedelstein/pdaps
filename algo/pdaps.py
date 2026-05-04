@@ -79,6 +79,7 @@ class PDAPS(Algo):
         warm_fraction=0.0,
         inner_sigma_max=float("inf"),
         eps=1e-8,
+        log_level="INFO",
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -91,6 +92,7 @@ class PDAPS(Algo):
         self.inner_sigma_max = float(inner_sigma_max)
         self.eps = float(eps)
         self.last_gate_stats = []
+        self.log_level = log_level
 
     @staticmethod
     def to_complex(x):
