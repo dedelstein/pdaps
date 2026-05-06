@@ -76,6 +76,8 @@ def grid(points):
 
 
 def method_grid(preset="tiny", log_level="INFO"):
+    if preset == "pdaps_ablations":
+        return _pdaps_ablations_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
     if preset == "smoke":
         dps_scales = [1.0]
@@ -223,26 +225,85 @@ PDAPS_INNER_SIGMA_MAX = 0.3
 
 
 def pdaps_entry(method, warm_mode, gamma, warm_fraction,
-                inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25, log_level="INFO"):
+                inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25, log_level="INFO",
+                lam_floor=0.0, noise_tau=1.0, edm_project_post=False, label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
+    params = {
+        "gamma": gamma, "warm_fraction": warm_fraction,
+        "inner_sigma_max": inner_str, "lgvd_num_steps": int(lgvd_num_steps),
+    }
+    if lam_floor > 0.0:
+        params["lam_floor"] = float(lam_floor)
+    if noise_tau != 1.0:
+        params["noise_tau"] = float(noise_tau)
+    if edm_project_post:
+        params["edm_proj"] = True
+    method_label = method + (f"[{label_suffix}]" if label_suffix else "")
     return {
-        "method": method,
-        "params": {
-            "gamma": gamma, "warm_fraction": warm_fraction,
-            "inner_sigma_max": inner_str, "lgvd_num_steps": int(lgvd_num_steps),
-        },
+        "method": method_label,
+        "params": params,
         "algorithm": {
             "_target_": "algo.pdaps.PDAPS",
             "annealing_scheduler_config": ANNEALING,
             "diffusion_scheduler_config": REVERSE_ODE,
             "lgvd_config": {"num_steps": int(lgvd_num_steps), "gamma": gamma,
-                            "cg_iter": 10, "lr_min_ratio": 0.01},
+                            "cg_iter": 10, "lr_min_ratio": 0.01,
+                            "lam_floor": float(lam_floor), "noise_tau": float(noise_tau)},
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
             "inner_sigma_max": inner_sigma_max,
+            "edm_project_post": bool(edm_project_post),
             "log_level": log_level,
         },
     }
+
+
+def _pdaps_ablations_grid(log_level="INFO"):
+    """
+    Each ablation isolates one mechanism so we can attribute PSNR gains/losses
+    cleanly. All variants run at iso-NFE (lgvd_num_steps=100) with the
+    productive σ-gate (inner_sigma_max=5.0) and γ=0.5.
+    """
+    methods = []
+    # Reference: DAPS at its validated lr.
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(method="P-DAPS", warm_mode="none", gamma=0.5, warm_fraction=0.0,
+                  inner_sigma_max=5.0, lgvd_num_steps=100, log_level=log_level)
+
+    # (1) Baseline P-DAPS at iso-NFE (no ablation knob applied).
+    methods.append(pdaps_entry(**common, label_suffix="baseline"))
+
+    # (2) λ-floor: clamp 1/σ² to ≥ 1.0 inside the inner step. At σ>1 the
+    #     unfloored λ makes the M⁻¹ noise blow up in nullspace; flooring caps it.
+    methods.append(pdaps_entry(**common, lam_floor=1.0, label_suffix="lamfloor1"))
+
+    # (3) EDM post-projection: feed x_clean through one Tweedie pass at the
+    #     current outer σ before re-noise — pulls OOD samples back.
+    methods.append(pdaps_entry(**common, edm_project_post=True, label_suffix="edmproj"))
+
+    # (4) Drift-only: noise_tau=0 disables the Langevin noise term entirely
+    #     (preconditioned gradient descent on score_lik + score_prior).
+    methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
+
+    # (5) Warm-noise: noise_tau=0.1 — a 10× temperature drop, intermediate
+    #     between full pULA (1.0) and drift-only (0.0).
+    methods.append(pdaps_entry(**common, noise_tau=0.1, label_suffix="tau0p1"))
+
+    # (6) Combined fix: λ-floor + EDM-project + warm noise.
+    methods.append(pdaps_entry(**common, lam_floor=1.0, noise_tau=0.1,
+                               edm_project_post=True, label_suffix="combo"))
+    return methods
 
 
 def load_model(args, device):
@@ -406,7 +467,7 @@ def parse_args():
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
-                                 "warm_sweep"),
+                                 "pdaps_ablations", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")

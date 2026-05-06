@@ -21,6 +21,8 @@ class MRIInnerPULA:
         tau=None,
         check_finite=False,
         finite_check_interval=1,
+        lam_floor=0.0,
+        noise_tau=1.0,
     ):
         self.num_steps = int(num_steps)
         if step_size is None:
@@ -30,9 +32,18 @@ class MRIInnerPULA:
         self.lr_min_ratio = float(lr_min_ratio)
         self.check_finite = bool(check_finite)
         self.finite_check_interval = max(1, int(finite_check_interval))
+        # lam_floor: clamp lam = 1/σ² from below. At high σ, the unfloored lam
+        # makes M = AHA + λI nearly singular in nullspace directions, blowing
+        # up the M⁻¹ noise. Setting lam_floor > 0 keeps the inner well-conditioned.
+        self.lam_floor = float(lam_floor)
+        # noise_tau: temperature on the Langevin noise. 1.0 = standard pULA;
+        # 0.0 = drift-only (deterministic preconditioned gradient descent on
+        # the data-fidelity + prior regularizer); intermediate = warm Langevin.
+        self.noise_tau = float(noise_tau)
 
     def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, return_full_stats=False):
-        lam = 1.0 / float(sigma) ** 2
+        lam_raw = 1.0 / float(sigma) ** 2
+        lam = max(lam_raw, self.lam_floor)
         gamma = self.step_size * (1.0 + ratio * (self.lr_min_ratio - 1.0))
 
         score_lik = pdaps.AH(y - pdaps.A(x))
@@ -43,19 +54,27 @@ class MRIInnerPULA:
 
         # torch complex randn has Var(real)=Var(imag)=1/2; scale by sqrt(2)
         # to match independent unit-variance real/imag Langevin noise.
-        n1 = math.sqrt(2.0) * torch.randn_like(y)
-        n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-        noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats or return_full_stats)
-        if return_stats or return_full_stats:
-            noise, cg_noise = noise
+        if self.noise_tau > 0.0:
+            n1 = math.sqrt(2.0) * torch.randn_like(y)
+            n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
+            noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats or return_full_stats)
+            if return_stats or return_full_stats:
+                noise, cg_noise = noise
+        else:
+            # Drift-only ablation: skip the noise solve entirely.
+            noise = torch.zeros_like(x)
+            cg_noise = 0
 
         step_drift = 0.5 * gamma * drift
-        step_noise = math.sqrt(gamma) * noise
+        step_noise = math.sqrt(gamma * self.noise_tau) * noise
 
         x_next = x + step_drift + step_noise
         if return_full_stats:
             stats = {
                 "lam": lam,
+                "lam_raw": lam_raw,
+                "lam_floored": lam > lam_raw + 1e-12,
+                "noise_tau": self.noise_tau,
                 "gamma_eff": gamma,
                 "score_lik_max": score_lik.abs().max().item(),
                 "score_lik_mean": score_lik.abs().mean().item(),
@@ -149,6 +168,7 @@ class PDAPS(Algo):
         inner_sigma_max=float("inf"),
         eps=1e-8,
         log_level="INFO",
+        edm_project_post=False,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -162,6 +182,11 @@ class PDAPS(Algo):
         self.eps = float(eps)
         self.last_gate_stats = []
         self.log_level = log_level
+        # edm_project_post: after the inner Langevin produces x_clean, run
+        # one Tweedie pass through the EDM denoiser at the *current* outer σ
+        # before re-noising. Pulls x_clean back onto the natural-image manifold
+        # so that nullspace excursions don't poison the next outer iteration.
+        self.edm_project_post = bool(edm_project_post)
 
     @staticmethod
     def to_complex(x):
@@ -296,14 +321,27 @@ class PDAPS(Algo):
 
                 if self.log_level == "DEBUG":
                     resid = self.residual_norm(x_clean, y).mean().item()
-                    lam = 1.0 / float(sigma) ** 2
+                    lam_raw = 1.0 / float(sigma) ** 2
+                    lam = max(lam_raw, self.inner.lam_floor)
                     gamma_eff = self.inner.step_size * (
                         1.0 + (i / max(1, N)) * (self.inner.lr_min_ratio - 1.0)
                     )
+                    # Range/null growth: how much did x grow in the measured
+                    # subspace (||A·x||) vs in total (||x||)? Big total/meas ratio
+                    # ⇒ inner Langevin is amplifying nullspace components.
+                    norm_x = x_clean.abs().square().flatten(start_dim=1).sum(dim=1).sqrt()
+                    norm_x0 = x0hat.abs().square().flatten(start_dim=1).sum(dim=1).sqrt().clamp_min(self.eps)
+                    norm_Ax = self.A(x_clean).abs().square().flatten(start_dim=1).sum(dim=1).sqrt()
+                    norm_Ax0 = self.A(x0hat).abs().square().flatten(start_dim=1).sum(dim=1).sqrt().clamp_min(self.eps)
+                    total_growth = (norm_x / norm_x0).mean().item()
+                    meas_growth = (norm_Ax / norm_Ax0).mean().item()
                     null_post = self.nullspace_energy(x_clean).mean().item()
+                    floor_flag = " [λ floored]" if lam > lam_raw + 1e-12 else ""
                     msg += (
                         f" resid_pre={resid_pre:.3e} resid={resid:.3e} "
-                        f"λ={lam:.3e} γ={gamma_eff:.3e} null_idx={null_post:.3e}{inner_stats}"
+                        f"λ={lam:.3e}{floor_flag} γ={gamma_eff:.3e} "
+                        f"null_idx={null_post:.3e} grow_tot={total_growth:.3f} grow_meas={meas_growth:.3f}"
+                        f"{inner_stats}"
                     )
 
                 if self.log_level in ["INFO", "DEBUG"]:
@@ -311,6 +349,22 @@ class PDAPS(Algo):
                         tqdm.tqdm.write(msg)
                     else:
                         print(msg)
+            # Optional EDM Tweedie projection: pull x_clean back onto the
+            # natural-image manifold by passing it through the denoiser at
+            # the current outer σ. Cheap (one forward pass), and washes out
+            # nullspace blowup that would otherwise propagate through re-noise.
+            if self.edm_project_post and sigma > self.inner_sigma_max:
+                # Skip the projection in the σ-band where the inner already
+                # ran — there x_clean is meant to be a refined Langevin sample
+                # we don't want to over-smooth.
+                pass
+            elif self.edm_project_post:
+                x_real = self.to_real(x_clean)
+                x_real = self.net(x_real, torch.as_tensor(sigma, device=x_real.device))
+                x_clean = self.to_complex(x_real)
+                if self.log_level == "DEBUG":
+                    print(f"[P-DAPS]   edm_project: post-proj x.max={x_clean.abs().max().item():.3e}", flush=True)
+
             x_prev = x_clean
             xt = self.to_real(
                 x_clean + math.sqrt(2.0) * torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1]

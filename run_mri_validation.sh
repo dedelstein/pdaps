@@ -22,6 +22,9 @@ set -euo pipefail
 #   iso-nfe        lgvd_num_steps sweep at R=4 and R=8.
 #   inner-sweep    inner_sigma_max sweep at R=4 and R=8.
 #   pdaps-tight    Focused P-DAPS gate/inner-step tuning at R=4.
+#   match-nfe      Iso-NFE (lgvd_num_steps=100) P-DAPS at productive σ-gates.
+#   ablations      Ablation study at iso-NFE: λ-floor / EDM-proj /
+#                  drift-only / warm-noise / combined fix.
 #
 # When --filenames is set (multi-file presets like `robust`), --val-slices
 # and --test-slices are interpreted *per file*. Otherwise per-run.
@@ -95,6 +98,14 @@ case "$PRESET" in
     pdaps-tight)
         ARGS=(--grid-preset pdaps_tight --acceleration 4)
         DEFAULT_SLICES=(--val-slices 1 --test-slices 1)
+        ;;
+    match-nfe)
+        ARGS=(--grid-preset pdaps_match_nfe --accelerations 4 8)
+        DEFAULT_SLICES=(--val-slices 3 --test-slices 5)
+        ;;
+    ablations)
+        ARGS=(--grid-preset pdaps_ablations --accelerations 4 8)
+        DEFAULT_SLICES=(--val-slices 2 --test-slices 3)
         ;;
     *)
         echo "Unknown preset: $PRESET" >&2
