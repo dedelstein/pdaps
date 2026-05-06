@@ -114,6 +114,21 @@ def method_grid(preset="tiny", log_level="INFO"):
         warm_fractions = [0.2]
         pdaps_inner_sigma_maxes = [PDAPS_INNER_SIGMA_MAX]
         pdaps_num_steps_list = [25, 50, 100]
+    elif preset == "pdaps_match_nfe":
+        # Iso-inner-step comparison vs DAPS. DAPS runs 100 inner Langevin
+        # steps per outer step (lgvd_config.num_steps=100); the inner-sweep
+        # preset gave P-DAPS only 25, so we couldn't tell if P-DAPS just
+        # needed more inner work. This preset runs P-DAPS at 100 inner steps
+        # and probes the two productive σ-gating regimes seen in debug logs:
+        # the "high gate" (inner fires from start, productive band σ≲7) and
+        # the "low gate" (inner fires only at σ≲5, avoiding nullspace blowup).
+        dps_scales = []
+        daps_lrs = [1e-5]              # DAPS reference (matches inner_sweep)
+        pula_gammas = []
+        pdaps_gammas = [0.5]
+        warm_fractions = [0.2]
+        pdaps_inner_sigma_maxes = [5.0, 1e9]   # productive gate + ungated
+        pdaps_num_steps_list = [100]
     elif preset == "warm_sweep":
         # Hold everything else at validated defaults; sweep warm_fraction.
         # Toy's safe band is ~[0.1, 0.3]; we span a wider range to verify
@@ -390,7 +405,8 @@ def parse_args():
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="VAL")
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
-                                 "pdaps_tight", "iso_nfe", "warm_sweep"),
+                                 "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
+                                 "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")

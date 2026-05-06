@@ -31,40 +31,93 @@ class MRIInnerPULA:
         self.check_finite = bool(check_finite)
         self.finite_check_interval = max(1, int(finite_check_interval))
 
-    def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False):
+    def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, return_full_stats=False):
         lam = 1.0 / float(sigma) ** 2
         gamma = self.step_size * (1.0 + ratio * (self.lr_min_ratio - 1.0))
 
         score_lik = pdaps.AH(y - pdaps.A(x))
         score_prior = -(x - x0hat) * lam
-        drift = pdaps.solve(score_lik + score_prior, lam, return_iters=return_stats)
-        if return_stats:
+        drift = pdaps.solve(score_lik + score_prior, lam, return_iters=return_stats or return_full_stats)
+        if return_stats or return_full_stats:
             drift, cg_drift = drift
 
         # torch complex randn has Var(real)=Var(imag)=1/2; scale by sqrt(2)
         # to match independent unit-variance real/imag Langevin noise.
         n1 = math.sqrt(2.0) * torch.randn_like(y)
         n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-        noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats)
-        if return_stats:
+        noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats or return_full_stats)
+        if return_stats or return_full_stats:
             noise, cg_noise = noise
 
         step_drift = 0.5 * gamma * drift
         step_noise = math.sqrt(gamma) * noise
 
         x_next = x + step_drift + step_noise
+        if return_full_stats:
+            stats = {
+                "lam": lam,
+                "gamma_eff": gamma,
+                "score_lik_max": score_lik.abs().max().item(),
+                "score_lik_mean": score_lik.abs().mean().item(),
+                "score_prior_max": score_prior.abs().max().item(),
+                "score_prior_mean": score_prior.abs().mean().item(),
+                "drift_solve_max": drift.abs().max().item(),
+                "drift_solve_mean": drift.abs().mean().item(),
+                "noise_solve_max": noise.abs().max().item(),
+                "noise_solve_mean": noise.abs().mean().item(),
+                "step_drift_max": step_drift.abs().max().item(),
+                "step_drift_mean": step_drift.abs().mean().item(),
+                "step_noise_max": step_noise.abs().max().item(),
+                "step_noise_mean": step_noise.abs().mean().item(),
+                "x_post_max": x_next.abs().max().item(),
+                "x_post_mean": x_next.abs().mean().item(),
+                "cg_drift": cg_drift,
+                "cg_noise": cg_noise,
+            }
+            return x_next, stats
         if return_stats:
             return x_next, step_drift.abs().mean().item(), step_noise.abs().mean().item(), cg_drift + cg_noise
         return x_next
 
-    def sample(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False):
+    def sample(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, trace_log=None):
+        """
+        trace_log: optional dict with keys {"outer": int, "stride": int, "y": tensor}
+        — when set, print per-inner-step diagnostics every `stride` steps
+        (and on first/last step). residual is computed against y.
+        """
         x = x.detach()
         x0hat = x0hat.detach()
         total_cg_iters = 0
         total_drift = 0.0
         total_noise = 0.0
+        tracing = trace_log is not None
+        stride = trace_log.get("stride", 0) if tracing else 0
+        outer = trace_log.get("outer", -1) if tracing else -1
         for step in range(self.num_steps):
-            if return_stats:
+            log_this = tracing and stride > 0 and (
+                step == 0 or step == self.num_steps - 1 or (step + 1) % stride == 0
+            )
+            if log_this:
+                x, full_stats = self.step(
+                    pdaps, x, x0hat, y, sigma, ratio, return_full_stats=True
+                )
+                resid = pdaps.residual_norm(x, y).mean().item()
+                msg = (
+                    f"[P-DAPS]   inner outer={outer:3d} k={step:3d}/{self.num_steps} "
+                    f"σ={sigma:.4g} λ={full_stats['lam']:.3e} γ={full_stats['gamma_eff']:.3e} "
+                    f"lik.max={full_stats['score_lik_max']:.3e} prior.max={full_stats['score_prior_max']:.3e} "
+                    f"drift_M⁻¹.max={full_stats['drift_solve_max']:.3e} "
+                    f"noise_M⁻¹.max={full_stats['noise_solve_max']:.3e} "
+                    f"step_drift.max={full_stats['step_drift_max']:.3e} "
+                    f"step_noise.max={full_stats['step_noise_max']:.3e} "
+                    f"x.max={full_stats['x_post_max']:.3e} resid={resid:.3e} "
+                    f"CG_d={full_stats['cg_drift']} CG_n={full_stats['cg_noise']}"
+                )
+                print(msg, flush=True)
+                total_drift += full_stats['step_drift_mean']
+                total_noise += full_stats['step_noise_mean']
+                total_cg_iters += full_stats['cg_drift'] + full_stats['cg_noise']
+            elif return_stats:
                 x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio, return_stats=True)
                 total_drift += d_norm
                 total_noise += n_norm
@@ -143,6 +196,17 @@ class PDAPS(Algo):
         m = max(1.0, float(self.forward_op.mask.expand_as(y[:1]).sum().item()))
         return r.abs().square().flatten(start_dim=1).sum(dim=1).sqrt() / math.sqrt(m)
 
+    def nullspace_energy(self, x):
+        """Per-sample RMS of (I - A⁺A) x — the part of x A cannot constrain.
+        Uses (I - AHA·M⁻¹) x with λ→0 limit approximated via a single CG-projected solve.
+        Cheaper proxy: AH(A x) - x scale. Here we report ||AHAx - x|| / ||x|| as an
+        unnormalized indicator of how far x sits from the range of AH (operator norm dependent)."""
+        Mx = self.AHA(x)
+        diff = Mx - x
+        denom = x.abs().square().flatten(start_dim=1).sum(dim=1).sqrt().clamp_min(self.eps)
+        num = diff.abs().square().flatten(start_dim=1).sum(dim=1).sqrt()
+        return num / denom
+
     def adaptive_alpha(self, x_prev, x0hat, y):
         drift = (x_prev - x0hat).abs().square().flatten(start_dim=1).sum(dim=1).sqrt()
         drift = drift / x0hat.abs().square().flatten(start_dim=1).sum(dim=1).sqrt().clamp_min(self.eps)
@@ -196,18 +260,28 @@ class PDAPS(Algo):
         
         disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
         steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
+        # At DEBUG: log a handful of inner steps per outer step so the trace
+        # is readable. Stride = ceil(num_steps/4) → ~4 samples + first + last.
+        inner_log_stride = max(1, self.inner.num_steps // 4) if self.log_level == "DEBUG" else 0
+
         for i in steps:
             sigma = self.annealing.sigma_steps[i]
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
+
+            # Pre-inner residual (what the inner correction starts from).
+            resid_pre = self.residual_norm(x0hat, y).mean().item() if self.log_level == "DEBUG" else None
+
             if sigma > self.inner_sigma_max:
                 x_clean = x0hat
                 inner_stats = ""
             else:
                 x_init = self.init_inner(x_prev, x0hat, y)
                 if self.log_level == "DEBUG":
+                    trace_log = {"outer": i, "stride": inner_log_stride, "y": y} if inner_log_stride > 0 else None
                     x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
-                        self, x_init, x0hat, y, sigma, i / max(1, N), return_stats=True
+                        self, x_init, x0hat, y, sigma, i / max(1, N),
+                        return_stats=True, trace_log=trace_log,
                     )
                     inner_dist = (x_clean - x0hat).abs().mean().item()
                     inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
@@ -219,10 +293,18 @@ class PDAPS(Algo):
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "
                        f"x0hat.max={x0hat.abs().max().item():.3e} "
                        f"x_clean.max={x_clean.abs().max().item():.3e}")
-                
+
                 if self.log_level == "DEBUG":
                     resid = self.residual_norm(x_clean, y).mean().item()
-                    msg += f" resid={resid:.3e}{inner_stats}"
+                    lam = 1.0 / float(sigma) ** 2
+                    gamma_eff = self.inner.step_size * (
+                        1.0 + (i / max(1, N)) * (self.inner.lr_min_ratio - 1.0)
+                    )
+                    null_post = self.nullspace_energy(x_clean).mean().item()
+                    msg += (
+                        f" resid_pre={resid_pre:.3e} resid={resid:.3e} "
+                        f"λ={lam:.3e} γ={gamma_eff:.3e} null_idx={null_post:.3e}{inner_stats}"
+                    )
 
                 if self.log_level in ["INFO", "DEBUG"]:
                     if verbose:
