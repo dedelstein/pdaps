@@ -1,15 +1,15 @@
 #!/bin/bash
 #BSUB -J pdaps_ablate_dbg
-#BSUB -q a100
+#BSUB -q gpul40s
 #BSUB -gpu "num=1:mode=exclusive_process"
-#BSUB -n 4
-#BSUB -R "rusage[mem=16GB]"
-#BSUB -W 12:00
+#BSUB -n 6
+#BSUB -R "rusage[mem=8GB]"
+#BSUB -W 16:00
+#BSUB -u s243446@dtu.dk
+#BSUB -B
+#BSUB -N
 #BSUB -o logs/pdaps_ablate_dbg.%J.out
 #BSUB -e logs/pdaps_ablate_dbg.%J.err
-
-cd /home/dan/DTU/Thesis/pdaps
-mkdir -p logs results
 
 OUT=results/pdaps_ablations_debug_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"
