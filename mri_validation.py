@@ -226,7 +226,10 @@ PDAPS_INNER_SIGMA_MAX = 0.3
 
 def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25, log_level="INFO",
-                lam_floor=0.0, noise_tau=1.0, edm_project_post=False, label_suffix=""):
+                lam_floor=0.0, target_lam_floor=None, solve_lam_floor=None,
+                noise_lam_floor=None, noise_tau=1.0, noise_mode="full",
+                gamma_schedule="constant", gamma_floor=0.0, gamma_ceiling=float("inf"),
+                edm_project_post=False, label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
         "gamma": gamma, "warm_fraction": warm_fraction,
@@ -234,11 +237,45 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
     }
     if lam_floor > 0.0:
         params["lam_floor"] = float(lam_floor)
+    if target_lam_floor is not None:
+        params["target_lam_floor"] = float(target_lam_floor)
+    if solve_lam_floor is not None:
+        params["solve_lam_floor"] = float(solve_lam_floor)
+    if noise_lam_floor is not None:
+        params["noise_lam_floor"] = float(noise_lam_floor)
     if noise_tau != 1.0:
         params["noise_tau"] = float(noise_tau)
+    if noise_mode != "full":
+        params["noise_mode"] = noise_mode
+    if gamma_schedule != "constant":
+        params["gamma_schedule"] = gamma_schedule
+    if gamma_floor > 0.0:
+        params["gamma_floor"] = float(gamma_floor)
+    if math.isfinite(gamma_ceiling):
+        params["gamma_ceiling"] = float(gamma_ceiling)
     if edm_project_post:
         params["edm_proj"] = True
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
+    lgvd_config = {
+        "num_steps": int(lgvd_num_steps),
+        "gamma": gamma,
+        "cg_iter": 10,
+        "lr_min_ratio": 0.01,
+        "lam_floor": float(lam_floor),
+        "noise_tau": float(noise_tau),
+        "noise_mode": noise_mode,
+        "gamma_schedule": gamma_schedule,
+    }
+    if gamma_floor > 0.0:
+        lgvd_config["gamma_floor"] = float(gamma_floor)
+    if math.isfinite(gamma_ceiling):
+        lgvd_config["gamma_ceiling"] = float(gamma_ceiling)
+    if target_lam_floor is not None:
+        lgvd_config["target_lam_floor"] = float(target_lam_floor)
+    if solve_lam_floor is not None:
+        lgvd_config["solve_lam_floor"] = float(solve_lam_floor)
+    if noise_lam_floor is not None:
+        lgvd_config["noise_lam_floor"] = float(noise_lam_floor)
     return {
         "method": method_label,
         "params": params,
@@ -246,9 +283,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "_target_": "algo.pdaps.PDAPS",
             "annealing_scheduler_config": ANNEALING,
             "diffusion_scheduler_config": REVERSE_ODE,
-            "lgvd_config": {"num_steps": int(lgvd_num_steps), "gamma": gamma,
-                            "cg_iter": 10, "lr_min_ratio": 0.01,
-                            "lam_floor": float(lam_floor), "noise_tau": float(noise_tau)},
+            "lgvd_config": lgvd_config,
             "warm_mode": warm_mode,
             "warm_fraction": warm_fraction,
             "inner_sigma_max": inner_sigma_max,
@@ -284,23 +319,48 @@ def _pdaps_ablations_grid(log_level="INFO"):
     # (1) Baseline P-DAPS at iso-NFE (no ablation knob applied).
     methods.append(pdaps_entry(**common, label_suffix="baseline"))
 
-    # (2) λ-floor: clamp 1/σ² to ≥ 1.0 inside the inner step. At σ>1 the
-    #     unfloored λ makes the M⁻¹ noise blow up in nullspace; flooring caps it.
+    # (2) Sigma-adaptive gamma: keep full pULA noise but shrink the EM step at
+    #     high sigma so gamma*sigma^2 is bounded in exact nullspace directions.
+    methods.append(pdaps_entry(**common, gamma_schedule="lambda_cap", label_suffix="g_lamcap"))
+
+    # (3) Uncapped gamma*lambda diagnostic. This is theoretically clean for
+    #     high-sigma nullspace variance but may be too aggressive below sigma=1.
+    methods.append(pdaps_entry(**common, gamma_schedule="lambda", label_suffix="g_lam"))
+
+    # (4) Gentler sigma-adaptive gamma diagnostic.
+    methods.append(pdaps_entry(**common, gamma_schedule="sqrt_lambda_cap", label_suffix="g_sqrtlamcap"))
+
+    # (5) Legacy λ-floor: clamp 1/σ² to ≥ 1.0 everywhere inside the inner step.
+    #     This changes the target/prior surrogate and the preconditioner together.
     methods.append(pdaps_entry(**common, lam_floor=1.0, label_suffix="lamfloor1"))
 
-    # (3) EDM post-projection: feed x_clean through one Tweedie pass at the
+    # (6) Bounded preconditioner only: keep the prior pull at raw lambda but cap
+    #     the solve/noise covariance floor. This distinguishes target changes
+    #     from preconditioner stabilization.
+    methods.append(pdaps_entry(**common, target_lam_floor=0.0, solve_lam_floor=1.0,
+                               noise_lam_floor=1.0, label_suffix="solvefloor1"))
+
+    # (7) Range-only noise diagnostic: remove sqrt(lambda)*n2 and keep A^H n1.
+    #     This is not standard pULA, but isolates nullspace noise injection.
+    methods.append(pdaps_entry(**common, noise_mode="range", label_suffix="range_noise"))
+
+    # (8) Null-only noise diagnostic: inject only sqrt(lambda)*n2. This should be
+    #     bad if the diagnosis is right.
+    methods.append(pdaps_entry(**common, noise_mode="null", label_suffix="null_noise"))
+
+    # (9) EDM post-projection: feed x_clean through one Tweedie pass at the
     #     current outer σ before re-noise — pulls OOD samples back.
     methods.append(pdaps_entry(**common, edm_project_post=True, label_suffix="edmproj"))
 
-    # (4) Drift-only: noise_tau=0 disables the Langevin noise term entirely
+    # (10) Drift-only: noise_tau=0 disables the Langevin noise term entirely
     #     (preconditioned gradient descent on score_lik + score_prior).
     methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
 
-    # (5) Warm-noise: noise_tau=0.1 — a 10× temperature drop, intermediate
+    # (11) Warm-noise: noise_tau=0.1 — a 10× temperature drop, intermediate
     #     between full pULA (1.0) and drift-only (0.0).
     methods.append(pdaps_entry(**common, noise_tau=0.1, label_suffix="tau0p1"))
 
-    # (6) Combined fix: λ-floor + EDM-project + warm noise.
+    # (12) Combined fix: λ-floor + EDM-project + warm noise.
     methods.append(pdaps_entry(**common, lam_floor=1.0, noise_tau=0.1,
                                edm_project_post=True, label_suffix="combo"))
     return methods

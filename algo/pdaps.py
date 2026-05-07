@@ -22,7 +22,14 @@ class MRIInnerPULA:
         check_finite=False,
         finite_check_interval=1,
         lam_floor=0.0,
+        target_lam_floor=None,
+        solve_lam_floor=None,
+        noise_lam_floor=None,
         noise_tau=1.0,
+        noise_mode="full",
+        gamma_schedule="constant",
+        gamma_floor=0.0,
+        gamma_ceiling=float("inf"),
     ):
         self.num_steps = int(num_steps)
         if step_size is None:
@@ -36,28 +43,80 @@ class MRIInnerPULA:
         # makes M = AHA + λI nearly singular in nullspace directions, blowing
         # up the M⁻¹ noise. Setting lam_floor > 0 keeps the inner well-conditioned.
         self.lam_floor = float(lam_floor)
+        self.target_lam_floor = float(lam_floor if target_lam_floor is None else target_lam_floor)
+        self.solve_lam_floor = float(lam_floor if solve_lam_floor is None else solve_lam_floor)
+        self.noise_lam_floor = float(lam_floor if noise_lam_floor is None else noise_lam_floor)
         # noise_tau: temperature on the Langevin noise. 1.0 = standard pULA;
         # 0.0 = drift-only (deterministic preconditioned gradient descent on
         # the data-fidelity + prior regularizer); intermediate = warm Langevin.
         self.noise_tau = float(noise_tau)
+        self.noise_mode = str(noise_mode)
+        valid_noise_modes = {"full", "range", "range_only", "null", "null_only", "none"}
+        if self.noise_mode not in valid_noise_modes:
+            raise ValueError(f"Unknown noise_mode: {self.noise_mode}")
+        self.gamma_schedule = str(gamma_schedule)
+        valid_gamma_schedules = {
+            "constant",
+            "lambda",
+            "lambda_cap",
+            "sqrt_lambda",
+            "sqrt_lambda_cap",
+        }
+        if self.gamma_schedule not in valid_gamma_schedules:
+            raise ValueError(f"Unknown gamma_schedule: {self.gamma_schedule}")
+        self.gamma_floor = float(gamma_floor)
+        self.gamma_ceiling = float(gamma_ceiling)
+
+    def lambdas(self, sigma):
+        lam_raw = 1.0 / float(sigma) ** 2
+        return {
+            "raw": lam_raw,
+            "target": max(lam_raw, self.target_lam_floor),
+            "solve": max(lam_raw, self.solve_lam_floor),
+            "noise": max(lam_raw, self.noise_lam_floor),
+        }
+
+    def effective_gamma(self, sigma, ratio):
+        lam_raw = 1.0 / float(sigma) ** 2
+        gamma = self.step_size * (1.0 + ratio * (self.lr_min_ratio - 1.0))
+        if self.gamma_schedule == "lambda":
+            gamma *= lam_raw
+        elif self.gamma_schedule == "lambda_cap":
+            gamma *= min(1.0, lam_raw)
+        elif self.gamma_schedule == "sqrt_lambda":
+            gamma *= math.sqrt(lam_raw)
+        elif self.gamma_schedule == "sqrt_lambda_cap":
+            gamma *= min(1.0, math.sqrt(lam_raw))
+        gamma = max(self.gamma_floor, gamma)
+        gamma = min(self.gamma_ceiling, gamma)
+        return gamma
 
     def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, return_full_stats=False):
-        lam_raw = 1.0 / float(sigma) ** 2
-        lam = max(lam_raw, self.lam_floor)
-        gamma = self.step_size * (1.0 + ratio * (self.lr_min_ratio - 1.0))
+        lams = self.lambdas(sigma)
+        lam_raw = lams["raw"]
+        lam_target = lams["target"]
+        lam_solve = lams["solve"]
+        lam_noise = lams["noise"]
+        gamma = self.effective_gamma(sigma, ratio)
 
         score_lik = pdaps.AH(y - pdaps.A(x))
-        score_prior = -(x - x0hat) * lam
-        drift = pdaps.solve(score_lik + score_prior, lam, return_iters=return_stats or return_full_stats)
+        score_prior = -(x - x0hat) * lam_target
+        drift = pdaps.solve(score_lik + score_prior, lam_solve, return_iters=return_stats or return_full_stats)
         if return_stats or return_full_stats:
             drift, cg_drift = drift
 
         # torch complex randn has Var(real)=Var(imag)=1/2; scale by sqrt(2)
         # to match independent unit-variance real/imag Langevin noise.
-        if self.noise_tau > 0.0:
+        if self.noise_tau > 0.0 and self.noise_mode != "none":
             n1 = math.sqrt(2.0) * torch.randn_like(y)
             n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-            noise = pdaps.solve(pdaps.AH(n1) + math.sqrt(lam) * n2, lam, return_iters=return_stats or return_full_stats)
+            if self.noise_mode in {"range", "range_only"}:
+                noise_rhs = pdaps.AH(n1)
+            elif self.noise_mode in {"null", "null_only"}:
+                noise_rhs = math.sqrt(lam_noise) * n2
+            else:
+                noise_rhs = pdaps.AH(n1) + math.sqrt(lam_noise) * n2
+            noise = pdaps.solve(noise_rhs, lam_solve, return_iters=return_stats or return_full_stats)
             if return_stats or return_full_stats:
                 noise, cg_noise = noise
         else:
@@ -71,10 +130,15 @@ class MRIInnerPULA:
         x_next = x + step_drift + step_noise
         if return_full_stats:
             stats = {
-                "lam": lam,
+                "lam": lam_solve,
                 "lam_raw": lam_raw,
-                "lam_floored": lam > lam_raw + 1e-12,
+                "lam_target": lam_target,
+                "lam_solve": lam_solve,
+                "lam_noise": lam_noise,
+                "lam_floored": max(lam_target, lam_solve, lam_noise) > lam_raw + 1e-12,
                 "noise_tau": self.noise_tau,
+                "noise_mode": self.noise_mode,
+                "gamma_schedule": self.gamma_schedule,
                 "gamma_eff": gamma,
                 "score_lik_max": score_lik.abs().max().item(),
                 "score_lik_mean": score_lik.abs().mean().item(),
@@ -321,11 +385,10 @@ class PDAPS(Algo):
 
                 if self.log_level == "DEBUG":
                     resid = self.residual_norm(x_clean, y).mean().item()
-                    lam_raw = 1.0 / float(sigma) ** 2
-                    lam = max(lam_raw, self.inner.lam_floor)
-                    gamma_eff = self.inner.step_size * (
-                        1.0 + (i / max(1, N)) * (self.inner.lr_min_ratio - 1.0)
-                    )
+                    lams = self.inner.lambdas(sigma)
+                    lam_raw = lams["raw"]
+                    lam = lams["solve"]
+                    gamma_eff = self.inner.effective_gamma(sigma, i / max(1, N))
                     # Range/null growth: how much did x grow in the measured
                     # subspace (||A·x||) vs in total (||x||)? Big total/meas ratio
                     # ⇒ inner Langevin is amplifying nullspace components.
