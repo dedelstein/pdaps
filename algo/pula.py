@@ -25,7 +25,17 @@ def _batch_view(x, ref):
     return x.view((x.shape[0],) + (1,) * (ref.ndim - 1))
 
 
-def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False, return_iters=False):
+def conjgrad(
+    normal_op,
+    b,
+    x,
+    lam,
+    max_iter,
+    tol=1e-10,
+    x_is_zero=False,
+    return_iters=False,
+    penalty_op=None,
+):
     """
     Conjugate gradient solver for (A^H A + λI) x = b.
 
@@ -43,14 +53,17 @@ def conjgrad(normal_op, b, x, lam, max_iter, tol=1e-10, x_is_zero=False, return_
     Returns:
         x, or (x, num_iters) when return_iters=True.
     """
-    # r = b - (A^H A + λI) x
-    r = b.clone() if x_is_zero else b - normal_op(x) - lam * x
+    if penalty_op is None:
+        penalty_op = lambda v: v
+
+    # r = b - (normal_op + λ penalty_op) x
+    r = b.clone() if x_is_zero else b - normal_op(x) - lam * penalty_op(x)
     p = r.clone()
     rs_old = _batch_inner(r, r)
 
     num_iters = 0
     for num_iters in range(1, max_iter + 1):
-        Ap = normal_op(p) + lam * p            # (A^H A + λI) p
+        Ap = normal_op(p) + lam * penalty_op(p)
         pAp = _batch_inner(p, Ap)
         active = pAp.abs() >= 1e-30
         if not active.any():

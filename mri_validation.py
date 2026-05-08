@@ -229,6 +229,9 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 lam_floor=0.0, target_lam_floor=None, solve_lam_floor=None,
                 noise_lam_floor=None, noise_tau=1.0, noise_mode="full",
                 gamma_schedule="constant", gamma_floor=0.0, gamma_ceiling=float("inf"),
+                precond_mode="standard", noise_rhs_mode="standard",
+                penalty_scale=1.0, penalty_schedule="lambda", penalty_eps=0.0,
+                mask_split_eps=1.0,
                 edm_project_post=False, label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
@@ -253,6 +256,18 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         params["gamma_floor"] = float(gamma_floor)
     if math.isfinite(gamma_ceiling):
         params["gamma_ceiling"] = float(gamma_ceiling)
+    if precond_mode != "standard":
+        params["precond_mode"] = precond_mode
+    if noise_rhs_mode != "standard":
+        params["noise_rhs_mode"] = noise_rhs_mode
+    if penalty_scale != 1.0:
+        params["penalty_scale"] = float(penalty_scale)
+    if penalty_schedule != "lambda":
+        params["penalty_schedule"] = penalty_schedule
+    if penalty_eps > 0.0:
+        params["penalty_eps"] = float(penalty_eps)
+    if mask_split_eps != 1.0:
+        params["mask_split_eps"] = float(mask_split_eps)
     if edm_project_post:
         params["edm_proj"] = True
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
@@ -265,6 +280,12 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "noise_tau": float(noise_tau),
         "noise_mode": noise_mode,
         "gamma_schedule": gamma_schedule,
+        "precond_mode": precond_mode,
+        "noise_rhs_mode": noise_rhs_mode,
+        "penalty_scale": float(penalty_scale),
+        "penalty_schedule": penalty_schedule,
+        "penalty_eps": float(penalty_eps),
+        "mask_split_eps": float(mask_split_eps),
     }
     if gamma_floor > 0.0:
         lgvd_config["gamma_floor"] = float(gamma_floor)
@@ -295,9 +316,9 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
 
 def _pdaps_ablations_grid(log_level="INFO"):
     """
-    Each ablation isolates one mechanism so we can attribute PSNR gains/losses
-    cleanly. All variants run at iso-NFE (lgvd_num_steps=100) with the
-    productive σ-gate (inner_sigma_max=5.0) and γ=0.5.
+    Big P-DAPS remediation grid. Drops already-characterized failed
+    gamma-schedule and lambda-floor variants, then tests the surviving
+    controls plus covariance-matched mask-split and Laplacian preconditioners.
     """
     methods = []
     # Reference: DAPS at its validated lr.
@@ -319,50 +340,55 @@ def _pdaps_ablations_grid(log_level="INFO"):
     # (1) Baseline P-DAPS at iso-NFE (no ablation knob applied).
     methods.append(pdaps_entry(**common, label_suffix="baseline"))
 
-    # (2) Sigma-adaptive gamma: keep full pULA noise but shrink the EM step at
-    #     high sigma so gamma*sigma^2 is bounded in exact nullspace directions.
-    methods.append(pdaps_entry(**common, gamma_schedule="lambda_cap", label_suffix="g_lamcap"))
-
-    # (3) Uncapped gamma*lambda diagnostic. This is theoretically clean for
-    #     high-sigma nullspace variance but may be too aggressive below sigma=1.
-    methods.append(pdaps_entry(**common, gamma_schedule="lambda", label_suffix="g_lam"))
-
-    # (4) Gentler sigma-adaptive gamma diagnostic.
-    methods.append(pdaps_entry(**common, gamma_schedule="sqrt_lambda_cap", label_suffix="g_sqrtlamcap"))
-
-    # (5) Legacy λ-floor: clamp 1/σ² to ≥ 1.0 everywhere inside the inner step.
-    #     This changes the target/prior surrogate and the preconditioner together.
-    methods.append(pdaps_entry(**common, lam_floor=1.0, label_suffix="lamfloor1"))
-
-    # (6) Bounded preconditioner only: keep the prior pull at raw lambda but cap
-    #     the solve/noise covariance floor. This distinguishes target changes
-    #     from preconditioner stabilization.
-    methods.append(pdaps_entry(**common, target_lam_floor=0.0, solve_lam_floor=1.0,
-                               noise_lam_floor=1.0, label_suffix="solvefloor1"))
-
-    # (7) Range-only noise diagnostic: remove sqrt(lambda)*n2 and keep A^H n1.
-    #     This is not standard pULA, but isolates nullspace noise injection.
+    # Existing winners and controls from the first debug run.
+    methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
     methods.append(pdaps_entry(**common, noise_mode="range", label_suffix="range_noise"))
-
-    # (8) Null-only noise diagnostic: inject only sqrt(lambda)*n2. This should be
-    #     bad if the diagnosis is right.
     methods.append(pdaps_entry(**common, noise_mode="null", label_suffix="null_noise"))
-
-    # (9) EDM post-projection: feed x_clean through one Tweedie pass at the
-    #     current outer σ before re-noise — pulls OOD samples back.
     methods.append(pdaps_entry(**common, edm_project_post=True, label_suffix="edmproj"))
 
-    # (10) Drift-only: noise_tau=0 disables the Langevin noise term entirely
-    #     (preconditioned gradient descent on score_lik + score_prior).
-    methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
-
-    # (11) Warm-noise: noise_tau=0.1 — a 10× temperature drop, intermediate
-    #     between full pULA (1.0) and drift-only (0.0).
+    # Fine-grained noise-temperature sweep.
+    methods.append(pdaps_entry(**common, noise_tau=0.025, label_suffix="tau0p025"))
+    methods.append(pdaps_entry(**common, noise_tau=0.05, label_suffix="tau0p05"))
     methods.append(pdaps_entry(**common, noise_tau=0.1, label_suffix="tau0p1"))
+    methods.append(pdaps_entry(**common, noise_tau=0.2, label_suffix="tau0p2"))
 
-    # (12) Combined fix: λ-floor + EDM-project + warm noise.
-    methods.append(pdaps_entry(**common, lam_floor=1.0, noise_tau=0.1,
-                               edm_project_post=True, label_suffix="combo"))
+    # Fourier-mask proxy for a TSVD subspace split.
+    methods.append(pdaps_entry(**common, precond_mode="mask_split",
+                               noise_rhs_mode="matched", label_suffix="split_matched"))
+    methods.append(pdaps_entry(**common, precond_mode="mask_split",
+                               noise_rhs_mode="matched", noise_tau=0.0,
+                               label_suffix="split_drift"))
+    methods.append(pdaps_entry(**common, precond_mode="mask_split",
+                               noise_rhs_mode="matched", noise_tau=0.1,
+                               label_suffix="split_tau0p1"))
+
+    # General-form Tikhonov with covariance-matched Laplacian noise.
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", label_suffix="lap_matched"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", noise_tau=0.0,
+                               label_suffix="lap_drift"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", noise_tau=0.1,
+                               label_suffix="lap_tau0p1"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="heuristic", label_suffix="lap_heur"))
+
+    # Laplacian strength controls: diagnose whether σ-coupled weighting is too weak.
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", penalty_scale=10.0,
+                               label_suffix="lap10_matched"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", penalty_scale=100.0,
+                               label_suffix="lap100_matched"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", penalty_scale=0.1,
+                               penalty_schedule="constant",
+                               label_suffix="lap_mu0p1_matched"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", penalty_scale=1.0,
+                               penalty_schedule="constant",
+                               label_suffix="lap_mu1_matched"))
     return methods
 
 

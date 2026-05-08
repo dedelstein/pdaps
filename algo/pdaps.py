@@ -30,6 +30,12 @@ class MRIInnerPULA:
         gamma_schedule="constant",
         gamma_floor=0.0,
         gamma_ceiling=float("inf"),
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        penalty_scale=1.0,
+        penalty_schedule="lambda",
+        penalty_eps=0.0,
+        mask_split_eps=1.0,
     ):
         self.num_steps = int(num_steps)
         if step_size is None:
@@ -66,6 +72,27 @@ class MRIInnerPULA:
             raise ValueError(f"Unknown gamma_schedule: {self.gamma_schedule}")
         self.gamma_floor = float(gamma_floor)
         self.gamma_ceiling = float(gamma_ceiling)
+        self.precond_mode = str(precond_mode)
+        valid_precond_modes = {"standard", "laplacian", "mask_split"}
+        if self.precond_mode not in valid_precond_modes:
+            raise ValueError(f"Unknown precond_mode: {self.precond_mode}")
+        self.noise_rhs_mode = str(noise_rhs_mode)
+        valid_noise_rhs_modes = {"standard", "matched", "heuristic"}
+        if self.noise_rhs_mode not in valid_noise_rhs_modes:
+            raise ValueError(f"Unknown noise_rhs_mode: {self.noise_rhs_mode}")
+        if self.precond_mode == "standard" and self.noise_rhs_mode == "heuristic":
+            raise ValueError("noise_rhs_mode='heuristic' is only meaningful for nonstandard preconditioners")
+        if self.precond_mode != "standard" and self.noise_rhs_mode == "standard":
+            raise ValueError("noise_rhs_mode='standard' is only valid with precond_mode='standard'")
+        self.penalty_scale = float(penalty_scale)
+        self.penalty_schedule = str(penalty_schedule)
+        valid_penalty_schedules = {"lambda", "constant"}
+        if self.penalty_schedule not in valid_penalty_schedules:
+            raise ValueError(f"Unknown penalty_schedule: {self.penalty_schedule}")
+        self.penalty_eps = float(penalty_eps)
+        self.mask_split_eps = float(mask_split_eps)
+        if self.penalty_scale < 0.0 or self.penalty_eps < 0.0 or self.mask_split_eps <= 0.0:
+            raise ValueError("penalty_scale and penalty_eps must be nonnegative; mask_split_eps must be positive")
 
     def lambdas(self, sigma):
         lam_raw = 1.0 / float(sigma) ** 2
@@ -91,6 +118,13 @@ class MRIInnerPULA:
         gamma = min(self.gamma_ceiling, gamma)
         return gamma
 
+    def effective_alpha(self, lam_raw):
+        if self.precond_mode != "laplacian":
+            return 0.0
+        if self.penalty_schedule == "constant":
+            return self.penalty_scale
+        return self.penalty_scale * lam_raw
+
     def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, return_full_stats=False):
         lams = self.lambdas(sigma)
         lam_raw = lams["raw"]
@@ -98,26 +132,96 @@ class MRIInnerPULA:
         lam_solve = lams["solve"]
         lam_noise = lams["noise"]
         gamma = self.effective_gamma(sigma, ratio)
+        alpha_eff = self.effective_alpha(lam_raw)
+        want_iters = return_stats or return_full_stats
+
+        def tensor_max(t):
+            return t.abs().max().item() if isinstance(t, torch.Tensor) else 0.0
 
         score_lik = pdaps.AH(y - pdaps.A(x))
         score_prior = -(x - x0hat) * lam_target
-        drift = pdaps.solve(score_lik + score_prior, lam_solve, return_iters=return_stats or return_full_stats)
-        if return_stats or return_full_stats:
+        drift_rhs = score_lik + score_prior
+        drift = pdaps.solve_precond(
+            drift_rhs,
+            lam_solve,
+            precond_mode=self.precond_mode,
+            alpha=alpha_eff,
+            penalty_eps=self.penalty_eps,
+            mask_split_eps=self.mask_split_eps,
+            return_iters=want_iters,
+        )
+        if want_iters:
             drift, cg_drift = drift
 
         # torch complex randn has Var(real)=Var(imag)=1/2; scale by sqrt(2)
         # to match independent unit-variance real/imag Langevin noise.
+        noise_rhs = torch.zeros_like(x)
+        range_rhs = torch.zeros_like(x)
+        null_rhs = torch.zeros_like(x)
         if self.noise_tau > 0.0 and self.noise_mode != "none":
             n1 = math.sqrt(2.0) * torch.randn_like(y)
             n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-            if self.noise_mode in {"range", "range_only"}:
-                noise_rhs = pdaps.AH(n1)
-            elif self.noise_mode in {"null", "null_only"}:
-                noise_rhs = math.sqrt(lam_noise) * n2
+            ah_n1 = pdaps.AH(n1)
+
+            if self.precond_mode == "laplacian" and self.noise_rhs_mode == "matched":
+                ng_x = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
+                ng_y = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
+                penalty_rhs = math.sqrt(max(alpha_eff, 0.0)) * pdaps.divH(ng_x, ng_y)
+                if self.penalty_eps > 0.0:
+                    penalty_rhs = penalty_rhs + math.sqrt(self.penalty_eps) * n2
+                if self.noise_mode in {"range", "range_only"}:
+                    noise_rhs = ah_n1
+                elif self.noise_mode in {"null", "null_only"}:
+                    noise_rhs = penalty_rhs
+                else:
+                    noise_rhs = ah_n1 + penalty_rhs
+                noise = pdaps.solve_precond(
+                    noise_rhs,
+                    lam_solve,
+                    precond_mode=self.precond_mode,
+                    alpha=alpha_eff,
+                    penalty_eps=self.penalty_eps,
+                    mask_split_eps=self.mask_split_eps,
+                    return_iters=want_iters,
+                )
+            elif self.precond_mode == "mask_split" and self.noise_rhs_mode == "matched":
+                n3 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
+                range_rhs = pdaps.project_range(ah_n1 + math.sqrt(lam_noise) * n2)
+                null_rhs = math.sqrt(self.mask_split_eps) * pdaps.project_null(n3)
+                if self.noise_mode in {"range", "range_only"}:
+                    noise_rhs = range_rhs
+                    null_rhs = torch.zeros_like(x)
+                elif self.noise_mode in {"null", "null_only"}:
+                    noise_rhs = torch.zeros_like(x)
+                else:
+                    noise_rhs = range_rhs
+                noise = pdaps.solve_mask_split(
+                    noise_rhs,
+                    lam_solve,
+                    null_rhs=null_rhs,
+                    mask_split_eps=self.mask_split_eps,
+                    return_iters=want_iters,
+                )
             else:
-                noise_rhs = pdaps.AH(n1) + math.sqrt(lam_noise) * n2
-            noise = pdaps.solve(noise_rhs, lam_solve, return_iters=return_stats or return_full_stats)
-            if return_stats or return_full_stats:
+                if self.noise_mode in {"range", "range_only"}:
+                    noise_rhs = ah_n1
+                elif self.noise_mode in {"null", "null_only"}:
+                    noise_rhs = math.sqrt(lam_noise) * n2
+                else:
+                    noise_rhs = ah_n1 + math.sqrt(lam_noise) * n2
+                if self.precond_mode == "mask_split":
+                    range_rhs = pdaps.project_range(noise_rhs)
+                    null_rhs = pdaps.project_null(noise_rhs)
+                noise = pdaps.solve_precond(
+                    noise_rhs,
+                    lam_solve,
+                    precond_mode=self.precond_mode,
+                    alpha=alpha_eff,
+                    penalty_eps=self.penalty_eps,
+                    mask_split_eps=self.mask_split_eps,
+                    return_iters=want_iters,
+                )
+            if want_iters:
                 noise, cg_noise = noise
         else:
             # Drift-only ablation: skip the noise solve entirely.
@@ -138,20 +242,34 @@ class MRIInnerPULA:
                 "lam_floored": max(lam_target, lam_solve, lam_noise) > lam_raw + 1e-12,
                 "noise_tau": self.noise_tau,
                 "noise_mode": self.noise_mode,
+                "precond_mode": self.precond_mode,
+                "noise_rhs_mode": self.noise_rhs_mode,
+                "penalty_scale": self.penalty_scale,
+                "penalty_schedule": self.penalty_schedule,
+                "penalty_eps": self.penalty_eps,
+                "alpha_eff": alpha_eff,
                 "gamma_schedule": self.gamma_schedule,
                 "gamma_eff": gamma,
                 "score_lik_max": score_lik.abs().max().item(),
                 "score_lik_mean": score_lik.abs().mean().item(),
                 "score_prior_max": score_prior.abs().max().item(),
                 "score_prior_mean": score_prior.abs().mean().item(),
+                "drift_rhs_max": drift_rhs.abs().max().item(),
+                "noise_rhs_max": noise_rhs.abs().max().item(),
+                "range_rhs_max": range_rhs.abs().max().item(),
+                "null_rhs_max": null_rhs.abs().max().item(),
                 "drift_solve_max": drift.abs().max().item(),
                 "drift_solve_mean": drift.abs().mean().item(),
                 "noise_solve_max": noise.abs().max().item(),
                 "noise_solve_mean": noise.abs().mean().item(),
+                "lap_drift_max": tensor_max(pdaps.laplacian(drift)) if self.precond_mode == "laplacian" else 0.0,
+                "lap_noise_max": tensor_max(pdaps.laplacian(noise)) if self.precond_mode == "laplacian" else 0.0,
                 "step_drift_max": step_drift.abs().max().item(),
                 "step_drift_mean": step_drift.abs().mean().item(),
                 "step_noise_max": step_noise.abs().max().item(),
                 "step_noise_mean": step_noise.abs().mean().item(),
+                "range_step_max": tensor_max(pdaps.project_range(step_noise)) if self.precond_mode == "mask_split" else 0.0,
+                "null_step_max": tensor_max(pdaps.project_null(step_noise)) if self.precond_mode == "mask_split" else 0.0,
                 "x_post_max": x_next.abs().max().item(),
                 "x_post_mean": x_next.abs().mean().item(),
                 "cg_drift": cg_drift,
@@ -188,11 +306,17 @@ class MRIInnerPULA:
                 msg = (
                     f"[P-DAPS]   inner outer={outer:3d} k={step:3d}/{self.num_steps} "
                     f"σ={sigma:.4g} λ={full_stats['lam']:.3e} γ={full_stats['gamma_eff']:.3e} "
+                    f"pre={full_stats['precond_mode']} noise_rhs={full_stats['noise_rhs_mode']} "
+                    f"α={full_stats['alpha_eff']:.3e} μ={full_stats['penalty_scale']:.3g} "
+                    f"pen_sched={full_stats['penalty_schedule']} eps={full_stats['penalty_eps']:.1e} "
                     f"lik.max={full_stats['score_lik_max']:.3e} prior.max={full_stats['score_prior_max']:.3e} "
+                    f"rhs_n.max={full_stats['noise_rhs_max']:.3e} "
                     f"drift_M⁻¹.max={full_stats['drift_solve_max']:.3e} "
                     f"noise_M⁻¹.max={full_stats['noise_solve_max']:.3e} "
                     f"step_drift.max={full_stats['step_drift_max']:.3e} "
                     f"step_noise.max={full_stats['step_noise_max']:.3e} "
+                    f"range_step.max={full_stats['range_step_max']:.3e} "
+                    f"null_step.max={full_stats['null_step_max']:.3e} "
                     f"x.max={full_stats['x_post_max']:.3e} resid={resid:.3e} "
                     f"CG_d={full_stats['cg_drift']} CG_n={full_stats['cg_noise']}"
                 )
@@ -260,6 +384,28 @@ class PDAPS(Algo):
     def to_real(x):
         return torch.stack([x.real, x.imag], dim=1)
 
+    @staticmethod
+    def grad2d(x):
+        gx = torch.roll(x, shifts=-1, dims=-1) - x
+        gy = torch.roll(x, shifts=-1, dims=-2) - x
+        return gx, gy
+
+    @staticmethod
+    def divH(gx, gy):
+        dx = torch.roll(gx, shifts=1, dims=-1) - gx
+        dy = torch.roll(gy, shifts=1, dims=-2) - gy
+        return dx + dy
+
+    @staticmethod
+    def laplacian(x):
+        return (
+            4 * x
+            - torch.roll(x, shifts=1, dims=-1)
+            - torch.roll(x, shifts=-1, dims=-1)
+            - torch.roll(x, shifts=1, dims=-2)
+            - torch.roll(x, shifts=-1, dims=-2)
+        )
+
     def A(self, x):
         return mri_A(self, x)
 
@@ -269,16 +415,99 @@ class PDAPS(Algo):
     def AHA(self, x):
         return mri_AHA(self, x)
 
-    def solve(self, rhs, lam, return_iters=False):
+    def fourier_mask(self, x):
+        mask = self.forward_op.mask.to(device=x.device, dtype=x.real.dtype)
+        h, w = x.shape[-2], x.shape[-1]
+        if mask.shape[-2] == 1 and mask.shape[-1] == w:
+            return mask.reshape(1, 1, w)
+        if mask.shape[-2] == h and mask.shape[-1] == 1:
+            return mask.reshape(1, h, 1)
+        if mask.shape[-2] == h and mask.shape[-1] == w:
+            return mask.reshape(1, h, w)
+        raise ValueError(f"Unsupported MRI mask shape {tuple(mask.shape)} for image shape {tuple(x.shape)}")
+
+    def project_range(self, x):
+        mask = self.fourier_mask(x)
+        return self.forward_op.ifft(mask * self.forward_op.fft(x))
+
+    def project_null(self, x):
+        return x - self.project_range(x)
+
+    def solve(self, rhs, lam, return_iters=False, normal_op=None, penalty_op=None):
+        normal = self.AHA if normal_op is None else normal_op
         return conjgrad(
-            self.AHA,
+            normal,
             rhs,
             torch.zeros_like(rhs),
             lam,
             self.inner.cg_iter,
             x_is_zero=True,
             return_iters=return_iters,
+            penalty_op=penalty_op,
         )
+
+    def solve_laplacian(self, rhs, alpha, penalty_eps=0.0, return_iters=False):
+        if penalty_eps > 0.0:
+            normal_op = lambda v: self.AHA(v) + penalty_eps * v
+        else:
+            normal_op = self.AHA
+        return self.solve(
+            rhs,
+            alpha,
+            return_iters=return_iters,
+            normal_op=normal_op,
+            penalty_op=self.laplacian,
+        )
+
+    def solve_mask_split(self, rhs, lam, null_rhs=None, mask_split_eps=1.0, return_iters=False):
+        range_rhs = self.project_range(rhs)
+        if null_rhs is None:
+            null_rhs = self.project_null(rhs)
+        else:
+            null_rhs = self.project_null(null_rhs)
+
+        def range_normal(v):
+            return self.project_range(self.AHA(self.project_range(v)))
+
+        range_sol = conjgrad(
+            range_normal,
+            range_rhs,
+            torch.zeros_like(rhs),
+            lam,
+            self.inner.cg_iter,
+            x_is_zero=True,
+            return_iters=return_iters,
+        )
+        if return_iters:
+            range_sol, cg_iters = range_sol
+        null_sol = null_rhs / mask_split_eps
+        sol = self.project_range(range_sol) + null_sol
+        if return_iters:
+            return sol, cg_iters
+        return sol
+
+    def solve_precond(
+        self,
+        rhs,
+        lam,
+        precond_mode="standard",
+        alpha=0.0,
+        penalty_eps=0.0,
+        mask_split_eps=1.0,
+        return_iters=False,
+    ):
+        if precond_mode == "standard":
+            return self.solve(rhs, lam, return_iters=return_iters)
+        if precond_mode == "laplacian":
+            return self.solve_laplacian(rhs, alpha, penalty_eps=penalty_eps, return_iters=return_iters)
+        if precond_mode == "mask_split":
+            return self.solve_mask_split(
+                rhs,
+                lam,
+                mask_split_eps=mask_split_eps,
+                return_iters=return_iters,
+            )
+        raise ValueError(f"Unknown precond_mode: {precond_mode}")
 
     def residual_norm(self, x, y):
         r = self.A(x) - y
