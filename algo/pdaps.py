@@ -57,7 +57,7 @@ class MRIInnerPULA:
         # the data-fidelity + prior regularizer); intermediate = warm Langevin.
         self.noise_tau = float(noise_tau)
         self.noise_mode = str(noise_mode)
-        valid_noise_modes = {"full", "range", "range_only", "null", "null_only", "none"}
+        valid_noise_modes = {"full", "range_only", "image_only", "null_only", "none"}
         if self.noise_mode not in valid_noise_modes:
             raise ValueError(f"Unknown noise_mode: {self.noise_mode}")
         self.gamma_schedule = str(gamma_schedule)
@@ -84,6 +84,20 @@ class MRIInnerPULA:
             raise ValueError("noise_rhs_mode='heuristic' is only meaningful for nonstandard preconditioners")
         if self.precond_mode != "standard" and self.noise_rhs_mode == "standard":
             raise ValueError("noise_rhs_mode='standard' is only valid with precond_mode='standard'")
+        if self.precond_mode == "mask_split" and self.noise_rhs_mode == "matched" and self.noise_mode == "image_only":
+            raise ValueError(
+                "noise_mode='image_only' is invalid with precond_mode='mask_split' "
+                "and noise_rhs_mode='matched'"
+            )
+        if (
+            self.precond_mode == "laplacian"
+            and self.noise_rhs_mode == "matched"
+            and self.noise_mode in {"image_only", "null_only"}
+        ):
+            raise ValueError(
+                f"noise_mode='{self.noise_mode}' is invalid with precond_mode='laplacian' "
+                "and noise_rhs_mode='matched'"
+            )
         self.penalty_scale = float(penalty_scale)
         self.penalty_schedule = str(penalty_schedule)
         valid_penalty_schedules = {"lambda", "constant"}
@@ -169,12 +183,15 @@ class MRIInnerPULA:
                 penalty_rhs = math.sqrt(max(alpha_eff, 0.0)) * pdaps.divH(ng_x, ng_y)
                 if self.penalty_eps > 0.0:
                     penalty_rhs = penalty_rhs + math.sqrt(self.penalty_eps) * n2
-                if self.noise_mode in {"range", "range_only"}:
+                if self.noise_mode == "range_only":
                     noise_rhs = ah_n1
-                elif self.noise_mode in {"null", "null_only"}:
-                    noise_rhs = penalty_rhs
-                else:
+                elif self.noise_mode == "full":
                     noise_rhs = ah_n1 + penalty_rhs
+                else:
+                    raise ValueError(
+                        f"noise_mode='{self.noise_mode}' is invalid with precond_mode='laplacian' "
+                        "and noise_rhs_mode='matched'"
+                    )
                 noise = pdaps.solve_precond(
                     noise_rhs,
                     lam_solve,
@@ -187,28 +204,40 @@ class MRIInnerPULA:
             elif self.precond_mode == "mask_split" and self.noise_rhs_mode == "matched":
                 n3 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
                 range_rhs = pdaps.project_range(ah_n1 + math.sqrt(lam_noise) * n2)
-                null_rhs = math.sqrt(self.mask_split_eps) * pdaps.project_null(n3)
-                if self.noise_mode in {"range", "range_only"}:
+                # Matched null covariance is tied to the solve block. The public
+                # mask_split_eps knob remains for non-matched mask-split modes.
+                null_eps = lam_solve
+                null_rhs = math.sqrt(null_eps) * pdaps.project_null(n3)
+                if self.noise_mode == "range_only":
                     noise_rhs = range_rhs
                     null_rhs = torch.zeros_like(x)
-                elif self.noise_mode in {"null", "null_only"}:
+                elif self.noise_mode == "null_only":
                     noise_rhs = torch.zeros_like(x)
-                else:
+                elif self.noise_mode == "full":
                     noise_rhs = range_rhs
+                else:
+                    raise ValueError(
+                        f"noise_mode='{self.noise_mode}' is invalid with precond_mode='mask_split' "
+                        "and noise_rhs_mode='matched'"
+                    )
                 noise = pdaps.solve_mask_split(
                     noise_rhs,
                     lam_solve,
                     null_rhs=null_rhs,
-                    mask_split_eps=self.mask_split_eps,
+                    mask_split_eps=null_eps,
                     return_iters=want_iters,
                 )
             else:
-                if self.noise_mode in {"range", "range_only"}:
+                if self.noise_mode == "range_only":
                     noise_rhs = ah_n1
-                elif self.noise_mode in {"null", "null_only"}:
+                elif self.noise_mode == "image_only":
                     noise_rhs = math.sqrt(lam_noise) * n2
-                else:
+                elif self.noise_mode == "null_only":
+                    noise_rhs = math.sqrt(lam_noise) * pdaps.project_null(n2)
+                elif self.noise_mode == "full":
                     noise_rhs = ah_n1 + math.sqrt(lam_noise) * n2
+                else:
+                    raise ValueError(f"Unknown noise_mode: {self.noise_mode}")
                 if self.precond_mode == "mask_split":
                     range_rhs = pdaps.project_range(noise_rhs)
                     null_rhs = pdaps.project_null(noise_rhs)
@@ -230,9 +259,14 @@ class MRIInnerPULA:
 
         step_drift = 0.5 * gamma * drift
         step_noise = math.sqrt(gamma * self.noise_tau) * noise
+        step_total = step_drift + step_noise
 
-        x_next = x + step_drift + step_noise
+        x_next = x + step_total
         if return_full_stats:
+            x_null = pdaps.project_null(x_next)
+            x_range = pdaps.project_range(x_next)
+            x_null_norm = x_null.abs().square().mean().sqrt()
+            x_range_norm = x_range.abs().square().mean().sqrt()
             stats = {
                 "lam": lam_solve,
                 "lam_raw": lam_raw,
@@ -268,10 +302,15 @@ class MRIInnerPULA:
                 "step_drift_mean": step_drift.abs().mean().item(),
                 "step_noise_max": step_noise.abs().max().item(),
                 "step_noise_mean": step_noise.abs().mean().item(),
+                "step_total_max": step_total.abs().max().item(),
+                "step_total_over_sigma": step_total.abs().max().item() / max(float(sigma), 1e-12),
                 "range_step_max": tensor_max(pdaps.project_range(step_noise)) if self.precond_mode == "mask_split" else 0.0,
                 "null_step_max": tensor_max(pdaps.project_null(step_noise)) if self.precond_mode == "mask_split" else 0.0,
                 "x_post_max": x_next.abs().max().item(),
                 "x_post_mean": x_next.abs().mean().item(),
+                "x_null_norm": x_null_norm.item(),
+                "x_range_norm": x_range_norm.item(),
+                "x_null_ratio": (x_null_norm / x_range_norm.clamp_min(pdaps.eps)).item(),
                 "cg_drift": cg_drift,
                 "cg_noise": cg_noise,
             }
@@ -303,9 +342,10 @@ class MRIInnerPULA:
                     pdaps, x, x0hat, y, sigma, ratio, return_full_stats=True
                 )
                 resid = pdaps.residual_norm(x, y).mean().item()
+                floor_flag = " [λ floored]" if full_stats["lam_floored"] else ""
                 msg = (
                     f"[P-DAPS]   inner outer={outer:3d} k={step:3d}/{self.num_steps} "
-                    f"σ={sigma:.4g} λ={full_stats['lam']:.3e} γ={full_stats['gamma_eff']:.3e} "
+                    f"σ={sigma:.4g} λ={full_stats['lam']:.3e}{floor_flag} γ={full_stats['gamma_eff']:.3e} "
                     f"pre={full_stats['precond_mode']} noise_rhs={full_stats['noise_rhs_mode']} "
                     f"α={full_stats['alpha_eff']:.3e} μ={full_stats['penalty_scale']:.3g} "
                     f"pen_sched={full_stats['penalty_schedule']} eps={full_stats['penalty_eps']:.1e} "
@@ -315,9 +355,12 @@ class MRIInnerPULA:
                     f"noise_M⁻¹.max={full_stats['noise_solve_max']:.3e} "
                     f"step_drift.max={full_stats['step_drift_max']:.3e} "
                     f"step_noise.max={full_stats['step_noise_max']:.3e} "
+                    f"step_total.max={full_stats['step_total_max']:.3e} "
+                    f"step/σ={full_stats['step_total_over_sigma']:.3e} "
                     f"range_step.max={full_stats['range_step_max']:.3e} "
                     f"null_step.max={full_stats['null_step_max']:.3e} "
-                    f"x.max={full_stats['x_post_max']:.3e} resid={resid:.3e} "
+                    f"x.max={full_stats['x_post_max']:.3e} "
+                    f"x_null/range={full_stats['x_null_ratio']:.3e} resid={resid:.3e} "
                     f"CG_d={full_stats['cg_drift']} CG_n={full_stats['cg_noise']}"
                 )
                 print(msg, flush=True)
@@ -446,9 +489,12 @@ class PDAPS(Algo):
             penalty_op=penalty_op,
         )
 
-    def solve_laplacian(self, rhs, alpha, penalty_eps=0.0, return_iters=False):
-        if penalty_eps > 0.0:
-            normal_op = lambda v: self.AHA(v) + penalty_eps * v
+    def solve_laplacian(self, rhs, alpha, lam_solve=0.0, penalty_eps=0.0, return_iters=False):
+        # AHA is zero on forward-null directions. lam_solve I damps every
+        # direction, including DC where the Laplacian has eigenvalue zero.
+        diag = lam_solve + penalty_eps
+        if diag > 0.0:
+            normal_op = lambda v: self.AHA(v) + diag * v
         else:
             normal_op = self.AHA
         return self.solve(
@@ -499,7 +545,13 @@ class PDAPS(Algo):
         if precond_mode == "standard":
             return self.solve(rhs, lam, return_iters=return_iters)
         if precond_mode == "laplacian":
-            return self.solve_laplacian(rhs, alpha, penalty_eps=penalty_eps, return_iters=return_iters)
+            return self.solve_laplacian(
+                rhs,
+                alpha,
+                lam_solve=lam,
+                penalty_eps=penalty_eps,
+                return_iters=return_iters,
+            )
         if precond_mode == "mask_split":
             return self.solve_mask_split(
                 rhs,
@@ -628,11 +680,15 @@ class PDAPS(Algo):
                     total_growth = (norm_x / norm_x0).mean().item()
                     meas_growth = (norm_Ax / norm_Ax0).mean().item()
                     null_post = self.nullspace_energy(x_clean).mean().item()
+                    null_init = self.project_null(x0hat).norm()
+                    null_clean = self.project_null(x_clean).norm()
+                    inner_null_growth = (null_clean / null_init.clamp_min(self.eps)).item()
                     floor_flag = " [λ floored]" if lam > lam_raw + 1e-12 else ""
                     msg += (
                         f" resid_pre={resid_pre:.3e} resid={resid:.3e} "
                         f"λ={lam:.3e}{floor_flag} γ={gamma_eff:.3e} "
-                        f"null_idx={null_post:.3e} grow_tot={total_growth:.3f} grow_meas={meas_growth:.3f}"
+                        f"null_idx={null_post:.3e} inner_null_growth={inner_null_growth:.3f} "
+                        f"grow_tot={total_growth:.3f} grow_meas={meas_growth:.3f}"
                         f"{inner_stats}"
                     )
 

@@ -78,6 +78,8 @@ def grid(points):
 def method_grid(preset="tiny", log_level="INFO"):
     if preset == "pdaps_ablations":
         return _pdaps_ablations_grid(log_level=log_level)
+    if preset == "pdaps_remediation":
+        return _pdaps_remediation_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -344,8 +346,8 @@ def _pdaps_ablations_grid(log_level="INFO"):
 
     # Existing winners and controls from the first debug run.
     methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
-    methods.append(pdaps_entry(**common, noise_mode="range", label_suffix="range_noise"))
-    methods.append(pdaps_entry(**common, noise_mode="null", label_suffix="null_noise"))
+    methods.append(pdaps_entry(**common, noise_mode="range_only", label_suffix="range_noise"))
+    methods.append(pdaps_entry(**common, noise_mode="image_only", label_suffix="null_noise"))
     methods.append(pdaps_entry(**common, edm_project_post=True, label_suffix="edmproj"))
 
     # Fine-grained noise-temperature sweep.
@@ -394,6 +396,80 @@ def _pdaps_ablations_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_remediation_grid(log_level="INFO"):
+    """
+    Post-patch ablations validating the lam_floor / matched-mode fixes.
+
+    Compares standard, Laplacian, and mask-split preconditioners under the
+    fixed pipeline, with focused floor and noise-temperature sweeps.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(method="P-DAPS", warm_mode="none", gamma=0.5, warm_fraction=0.0,
+                  inner_sigma_max=5.0, lgvd_num_steps=100, log_level=log_level)
+
+    # Standard-preconditioner floor sweep.
+    methods.append(pdaps_entry(**common, label_suffix="baseline_lf0"))
+    methods.append(pdaps_entry(**common, lam_floor=0.01, label_suffix="baseline_lf0p01"))
+    methods.append(pdaps_entry(**common, lam_floor=0.1, label_suffix="baseline_lf0p1"))
+    methods.append(pdaps_entry(**common, lam_floor=1.0, label_suffix="baseline_lf1"))
+    methods.append(pdaps_entry(**common, lam_floor=10.0, label_suffix="baseline_lf10"))
+    methods.append(pdaps_entry(**common, solve_lam_floor=1.0, label_suffix="baseline_solve_lf1"))
+    methods.append(pdaps_entry(**common, noise_lam_floor=1.0, label_suffix="baseline_noise_lf1"))
+
+    # Laplacian matched-mode validation after threading lam_solve into the solve.
+    lap_common = dict(common, precond_mode="laplacian", noise_rhs_mode="matched")
+    methods.append(pdaps_entry(**lap_common, label_suffix="lap_matched_lf0"))
+    methods.append(pdaps_entry(**lap_common, lam_floor=0.1, label_suffix="lap_matched_lf0p1"))
+    methods.append(pdaps_entry(**lap_common, lam_floor=1.0, label_suffix="lap_matched_lf1"))
+    methods.append(pdaps_entry(**lap_common, lam_floor=10.0, label_suffix="lap_matched_lf10"))
+    methods.append(pdaps_entry(**lap_common, lam_floor=1.0, penalty_scale=10.0,
+                               label_suffix="lap_matched_pen10_lf1"))
+    methods.append(pdaps_entry(**lap_common, lam_floor=1.0, penalty_scale=100.0,
+                               label_suffix="lap_matched_pen100_lf1"))
+
+    # Mask-split matched-mode validation plus a non-matched eps knob check.
+    split_common = dict(common, precond_mode="mask_split", noise_rhs_mode="matched")
+    methods.append(pdaps_entry(**split_common, label_suffix="split_matched_lf0"))
+    methods.append(pdaps_entry(**split_common, lam_floor=1.0, label_suffix="split_matched_lf1"))
+    methods.append(pdaps_entry(**common, precond_mode="mask_split",
+                               noise_rhs_mode="heuristic", mask_split_eps=0.1,
+                               lam_floor=1.0, label_suffix="split_heur_eps0p1_lf1"))
+
+    # Noise-mode semantics under the standard preconditioner.
+    methods.append(pdaps_entry(**common, lam_floor=1.0, noise_mode="image_only",
+                               label_suffix="image_only_lf1"))
+    methods.append(pdaps_entry(**common, lam_floor=1.0, noise_mode="null_only",
+                               label_suffix="null_only_lf1"))
+    methods.append(pdaps_entry(**common, lam_floor=1.0, noise_mode="range_only",
+                               label_suffix="range_only_lf1"))
+
+    # 2D sweep at the working Laplacian matched corner.
+    floor_labels = [(0.1, "0p1"), (1.0, "1"), (10.0, "10")]
+    tau_labels = [(0.5, "0p5"), (1.0, "1")]
+    for lam_floor, lf_label in floor_labels:
+        for noise_tau, tau_label in tau_labels:
+            methods.append(pdaps_entry(
+                **lap_common,
+                lam_floor=lam_floor,
+                noise_tau=noise_tau,
+                label_suffix=f"lap_matched_lf{lf_label}_tau{tau_label}",
+            ))
+
+    return methods
+
+
 def _pdaps_targeted_grid(log_level="INFO"):
     """
     Targeted follow-up to the broad P-DAPS remediation ablation.
@@ -429,7 +505,7 @@ def _pdaps_targeted_grid(log_level="INFO"):
     methods.append(pdaps_entry(**common, precond_mode="laplacian",
                                noise_rhs_mode="matched", noise_tau=0.0,
                                label_suffix="lap_drift"))
-    methods.append(pdaps_entry(**common, noise_mode="range", label_suffix="range_noise"))
+    methods.append(pdaps_entry(**common, noise_mode="range_only", label_suffix="range_noise"))
     methods.append(pdaps_entry(**common, noise_tau=0.025, label_suffix="tau0p025"))
     methods.append(pdaps_entry(**common, noise_tau=0.05, label_suffix="tau0p05"))
 
@@ -457,7 +533,7 @@ def _pdaps_targeted_grid(log_level="INFO"):
     late_common = dict(common)
     late_common["inner_sigma_max"] = 3.0
     methods.append(pdaps_entry(**late_common, noise_tau=0.0, label_suffix="drift_s3"))
-    methods.append(pdaps_entry(**late_common, noise_mode="range", label_suffix="range_s3"))
+    methods.append(pdaps_entry(**late_common, noise_mode="range_only", label_suffix="range_s3"))
     methods.append(pdaps_entry(**late_common, noise_tau=0.025, label_suffix="tau0p025_s3"))
 
     return methods
@@ -624,7 +700,8 @@ def parse_args():
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
-                                 "pdaps_ablations", "pdaps_targeted", "warm_sweep"),
+                                 "pdaps_ablations", "pdaps_remediation",
+                                 "pdaps_targeted", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
