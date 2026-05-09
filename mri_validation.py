@@ -78,6 +78,8 @@ def grid(points):
 def method_grid(preset="tiny", log_level="INFO"):
     if preset == "pdaps_ablations":
         return _pdaps_ablations_grid(log_level=log_level)
+    if preset == "pdaps_targeted":
+        return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
     if preset == "smoke":
         dps_scales = [1.0]
@@ -392,6 +394,75 @@ def _pdaps_ablations_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_targeted_grid(log_level="INFO"):
+    """
+    Targeted follow-up to the broad P-DAPS remediation ablation.
+
+    Keeps the competitive candidates and tests the two main mechanism
+    conjectures from the DEBUG traces:
+    (1) useful stochasticity is either very small or range-restricted;
+    (2) delaying inner activation may prevent unrecoverable nullspace growth.
+    Known complete failures are intentionally dropped, except baseline as a
+    single failure reference.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(method="P-DAPS", warm_mode="none", gamma=0.5, warm_fraction=0.0,
+                  inner_sigma_max=5.0, lgvd_num_steps=100, log_level=log_level)
+
+    # One failure reference to confirm the known nullspace-injection mode.
+    methods.append(pdaps_entry(**common, label_suffix="baseline"))
+
+    # Main candidate set from the 2026-05-08 debug ablation.
+    methods.append(pdaps_entry(**common, noise_tau=0.0, label_suffix="drift"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", noise_tau=0.0,
+                               label_suffix="lap_drift"))
+    methods.append(pdaps_entry(**common, noise_mode="range", label_suffix="range_noise"))
+    methods.append(pdaps_entry(**common, noise_tau=0.025, label_suffix="tau0p025"))
+    methods.append(pdaps_entry(**common, noise_tau=0.05, label_suffix="tau0p05"))
+
+    # Fine tiny-noise probes around the apparent stable stochastic window.
+    methods.append(pdaps_entry(**common, noise_tau=0.005, label_suffix="tau0p005"))
+    methods.append(pdaps_entry(**common, noise_tau=0.01, label_suffix="tau0p01"))
+    methods.append(pdaps_entry(**common, noise_tau=0.02, label_suffix="tau0p02"))
+
+    # Laplacian + small stochasticity probes: does the good deterministic
+    # Laplacian correction tolerate tiny matched noise?
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", noise_tau=0.025,
+                               label_suffix="lap_tau0p025"))
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", noise_tau=0.05,
+                               label_suffix="lap_tau0p05"))
+
+    # Borderline strength control from the broad run: keep one scaled
+    # Laplacian matched-noise point to see if it survives broader sampling.
+    methods.append(pdaps_entry(**common, precond_mode="laplacian",
+                               noise_rhs_mode="matched", penalty_scale=100.0,
+                               label_suffix="lap100_matched"))
+
+    # Delayed inner-activation probes for the best stochastic candidates.
+    late_common = dict(common)
+    late_common["inner_sigma_max"] = 3.0
+    methods.append(pdaps_entry(**late_common, noise_tau=0.0, label_suffix="drift_s3"))
+    methods.append(pdaps_entry(**late_common, noise_mode="range", label_suffix="range_s3"))
+    methods.append(pdaps_entry(**late_common, noise_tau=0.025, label_suffix="tau0p025_s3"))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -553,7 +624,7 @@ def parse_args():
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
-                                 "pdaps_ablations", "warm_sweep"),
+                                 "pdaps_ablations", "pdaps_targeted", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")

@@ -25,6 +25,8 @@ set -euo pipefail
 #   match-nfe      Iso-NFE (lgvd_num_steps=100) P-DAPS at productive σ-gates.
 #   ablations      Ablation study at iso-NFE: λ-floor / EDM-proj /
 #                  drift-only / warm-noise / combined fix.
+#   targeted       Targeted P-DAPS follow-up: credible candidates, tiny-noise
+#                  sweep, and delayed inner-activation probes.
 #
 # When --filenames is set (multi-file presets like `robust`), --val-slices
 # and --test-slices are interpreted *per file*. Otherwise per-run.
@@ -105,6 +107,10 @@ case "$PRESET" in
         ;;
     ablations)
         ARGS=(--grid-preset pdaps_ablations --accelerations 4 8)
+        DEFAULT_SLICES=(--val-slices 2 --test-slices 3)
+        ;;
+    targeted)
+        ARGS=(--grid-preset pdaps_targeted --accelerations 4 8)
         DEFAULT_SLICES=(--val-slices 2 --test-slices 3)
         ;;
     *)
