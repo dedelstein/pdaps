@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import csv
+import io
 import itertools
 import json
 import math
@@ -75,11 +77,29 @@ def grid(points):
         yield dict(zip(keys, values))
 
 
+class _Tee(io.TextIOBase):
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
 def method_grid(preset="tiny", log_level="INFO"):
     if preset == "pdaps_ablations":
         return _pdaps_ablations_grid(log_level=log_level)
     if preset == "pdaps_remediation":
         return _pdaps_remediation_grid(log_level=log_level)
+    if preset == "pdaps_mechanism":
+        return _pdaps_mechanism_grid(log_level=log_level)
+    if preset == "pdaps_nullspace_focus":
+        return _pdaps_nullspace_focus_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -236,6 +256,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 precond_mode="standard", noise_rhs_mode="standard",
                 penalty_scale=1.0, penalty_schedule="lambda", penalty_eps=0.0,
                 mask_split_eps=1.0,
+                mid_inner_project_every=0, tweedie_reanchor_every=0,
                 edm_project_post=False, label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
@@ -272,6 +293,10 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         params["penalty_eps"] = float(penalty_eps)
     if mask_split_eps != 1.0:
         params["mask_split_eps"] = float(mask_split_eps)
+    if mid_inner_project_every > 0:
+        params["mid_inner_project_every"] = int(mid_inner_project_every)
+    if tweedie_reanchor_every > 0:
+        params["tweedie_reanchor_every"] = int(tweedie_reanchor_every)
     if edm_project_post:
         params["edm_proj"] = True
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
@@ -290,6 +315,8 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "penalty_schedule": penalty_schedule,
         "penalty_eps": float(penalty_eps),
         "mask_split_eps": float(mask_split_eps),
+        "mid_inner_project_every": int(mid_inner_project_every),
+        "tweedie_reanchor_every": int(tweedie_reanchor_every),
     }
     if gamma_floor > 0.0:
         lgvd_config["gamma_floor"] = float(gamma_floor)
@@ -539,6 +566,136 @@ def _pdaps_targeted_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_mechanism_grid(log_level="INFO"):
+    """
+    Follow-up mechanism grid for the 2026-05-09 P-DAPS remediation run.
+
+    Keeps the directly comparable DAPS / range-only / Laplacian references,
+    then adds the drift, truncation, warm-start, gamma-schedule, composition,
+    EDM projection, mid-inner projection, re-anchor, and null-Laplacian cells.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(method="P-DAPS", warm_mode="none", gamma=0.5, warm_fraction=0.0,
+                  inner_sigma_max=5.0, lgvd_num_steps=100, log_level=log_level)
+    range_common = dict(common, lam_floor=1.0, noise_mode="range_only")
+    lap_common = dict(common, lam_floor=1.0, precond_mode="laplacian",
+                      noise_rhs_mode="matched", penalty_scale=100.0)
+    lap_null_common = dict(common, lam_floor=1.0, precond_mode="laplacian_null",
+                           noise_rhs_mode="matched", penalty_scale=100.0)
+
+    def cell(base, label_suffix, **overrides):
+        cfg = dict(base)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    # Direct references from the previous remediation grid.
+    methods.append(cell(range_common, "range_only_lf1"))
+    methods.append(cell(lap_common, "lap_matched_pen100_lf1"))
+
+    # H1: deterministic drift toward the local Gaussian-MAP target.
+    methods.append(cell(range_common, "range_drift", noise_tau=0.0))
+    methods.append(cell(lap_common, "lap_pen100_drift", noise_tau=0.0))
+
+    # H2: early stopping / inner truncation.
+    methods.append(cell(range_common, "range_only_inner25", lgvd_num_steps=25))
+    methods.append(cell(range_common, "range_only_inner50", lgvd_num_steps=50))
+
+    # H3: warm-start regularization.
+    methods.append(cell(range_common, "range_only_warm03", warm_mode="fixed", warm_fraction=0.3))
+    methods.append(cell(range_common, "range_only_warm05", warm_mode="fixed", warm_fraction=0.5))
+    methods.append(cell(lap_common, "lap_pen100_warm03", warm_mode="fixed", warm_fraction=0.3))
+
+    # H4: sigma-dependent gamma schedule and floor.
+    methods.append(cell(range_common, "range_only_lambdacap", gamma_schedule="lambda_cap"))
+    methods.append(cell(range_common, "range_only_lambdacap_floor",
+                        gamma_schedule="lambda_cap", gamma_floor=0.05))
+    methods.append(cell(lap_common, "lap_pen100_lambdacap", gamma_schedule="lambda_cap"))
+
+    # H5: range-restricted noise composed with Laplacian preconditioning.
+    methods.append(cell(lap_common, "range_lap_pen100", noise_mode="range_only"))
+
+    # H6: once-per-outer EDM projection.
+    methods.append(cell(range_common, "range_only_edmproj", edm_project_post=True))
+    methods.append(cell(lap_common, "lap_pen100_edmproj", edm_project_post=True))
+
+    # B.1.1: mid-inner EDM projection.
+    methods.append(cell(range_common, "range_only_midproj50", mid_inner_project_every=50))
+    methods.append(cell(range_common, "range_only_midproj25", mid_inner_project_every=25))
+    methods.append(cell(lap_common, "lap_pen100_midproj50", mid_inner_project_every=50))
+
+    # B.1.2: Tweedie re-anchoring inside the inner loop.
+    methods.append(cell(range_common, "range_only_reanchor50", tweedie_reanchor_every=50))
+    methods.append(cell(range_common, "range_only_reanchor25", tweedie_reanchor_every=25))
+
+    # B.1.3: range-restricted Laplacian penalty.
+    methods.append(cell(lap_null_common, "lap_null_pen100"))
+    methods.append(cell(lap_null_common, "range_lap_null_pen100", noise_mode="range_only"))
+
+    return methods
+
+
+def _pdaps_nullspace_focus_grid(log_level="INFO"):
+    """
+    Compact confirmation grid for the null-space noise mechanism.
+
+    Intended for multi-slice / multi-seed reruns after the broad remediation
+    screen: DAPS, the two strongest single fixes, their composition, one
+    warm-start probe on the composed candidate, and a small lower-σ gate sweep
+    on the composed candidate.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(method="P-DAPS", warm_mode="none", gamma=0.5, warm_fraction=0.0,
+                  inner_sigma_max=5.0, lgvd_num_steps=100, log_level=log_level,
+                  lam_floor=1.0)
+    lap_common = dict(common, precond_mode="laplacian", noise_rhs_mode="matched")
+
+    def cell(base, label_suffix, **overrides):
+        cfg = dict(base)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    methods.append(cell(common, "range_only_lf1", noise_mode="range_only"))
+    methods.append(cell(lap_common, "lap_matched_pen100_lf1", penalty_scale=100.0))
+    methods.append(cell(lap_common, "lap_matched_lf1_tau0p5", noise_tau=0.5))
+    methods.append(cell(lap_common, "range_lap_pen100", noise_mode="range_only",
+                        penalty_scale=100.0))
+    methods.append(cell(lap_common, "range_lap_pen100_warm03", noise_mode="range_only",
+                        penalty_scale=100.0, warm_mode="fixed", warm_fraction=0.3))
+    methods.append(cell(lap_common, "range_lap_pen100_s3", noise_mode="range_only",
+                        penalty_scale=100.0, inner_sigma_max=3.0))
+    methods.append(cell(lap_common, "range_lap_pen100_s1", noise_mode="range_only",
+                        penalty_scale=100.0, inner_sigma_max=1.0))
+    methods.append(cell(lap_common, "range_lap_pen100_warm03_s3", noise_mode="range_only",
+                        penalty_scale=100.0, warm_mode="fixed", warm_fraction=0.3,
+                        inner_sigma_max=3.0))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -569,58 +726,74 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    forward_op = make_forward_op(args, device)
-    algo = hydra.utils.instantiate(OmegaConf.create(entry["algorithm"]), forward_op=forward_op, net=net)
-    data = move_to_device(sample, device)
-    data = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
-    observation = forward_op(data)
-    target = data["target"]
-
     row = {
         "split": split,
         "sample_idx": sample_idx,
         "filename": filename,
+        "seed": args.seed,
         "acceleration": args.acceleration,
         "method": entry["method"],
         "params_json": json.dumps(entry["params"], sort_keys=True),
         "failed": False,
     }
 
-    start = time.perf_counter()
-    try:
-        recon = algo.inference(observation, num_samples=1, verbose=args.verbose)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        metrics = compute_metrics_dict(forward_op, recon, target, observation)
-        row.update(metrics)
-        metric_names = ("psnr", "ssim", "nmse", "data_misfit", "data_misfit_per_observed")
-        if not metrics.get("finite", False) or not all(math.isfinite(float(metrics[name])) for name in metric_names):
-            row["failed"] = True
-            row["error"] = "nonfinite_reconstruction_or_metrics"
-        row["runtime_s"] = time.perf_counter() - start
-        row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
-        
-        if save_image and not row["failed"]:
-            cfg = OmegaConf.create({
-                "algorithm": {"_target_": entry["algorithm"]["_target_"]},
-                "forward_op": {"acceleration_ratio": args.acceleration},
-            })
-            image_dir = out_dir / "figures" / entry["method"].replace("/", "_")
-            image_dir.mkdir(parents=True, exist_ok=True)
-            old_cwd = os.getcwd()
-            os.chdir(image_dir)
+    sanitized_method = entry["method"].replace("/", "_").replace("[", "_").replace("]", "_")
+    log_dir = out_dir / "logs" / f"accel_{args.acceleration}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    seeds = getattr(args, "seeds", None)
+    seed_suffix = f"_seed{args.seed}" if seeds and len(seeds) > 1 else ""
+    log_path = log_dir / f"{sanitized_method}_{split}_{sample_idx}{seed_suffix}.log"
+
+    with open(log_path, "w") as log_fh:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, log_fh)), contextlib.redirect_stderr(_Tee(sys.stderr, log_fh)):
+            start = time.perf_counter()
             try:
-                visualize_recon(forward_op, forward_op.unnormalize(recon).cpu(), forward_op.unnormalize(target).cpu(), sample_idx, cfg)
-            finally:
-                os.chdir(old_cwd)
-    except Exception as exc:
-        row["failed"] = True
-        row["error"] = repr(exc)
-        row["runtime_s"] = time.perf_counter() - start
-        
-    status_str = f"[FAILED: {row.get('error', 'unknown')}]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
-    print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
-          f"{status_str} DataMisfit={row.get('data_misfit', 0.0):.3e} Time={row['runtime_s']:.1f}s")
+                forward_op = make_forward_op(args, device)
+                algo = hydra.utils.instantiate(OmegaConf.create(entry["algorithm"]), forward_op=forward_op, net=net)
+                data = move_to_device(sample, device)
+                data = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+                observation = forward_op(data)
+                target = data["target"]
+
+                recon = algo.inference(observation, num_samples=1, verbose=args.verbose)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                metrics = compute_metrics_dict(forward_op, recon, target, observation)
+                row.update(metrics)
+                metric_names = ("psnr", "ssim", "nmse", "data_misfit", "data_misfit_per_observed")
+                if not metrics.get("finite", False) or not all(math.isfinite(float(metrics[name])) for name in metric_names):
+                    row["failed"] = True
+                    row["error"] = "nonfinite_reconstruction_or_metrics"
+                row["runtime_s"] = time.perf_counter() - start
+                row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
+
+                if save_image and not row["failed"]:
+                    cfg = OmegaConf.create({
+                        "algorithm": {"_target_": entry["algorithm"]["_target_"]},
+                        "forward_op": {"acceleration_ratio": args.acceleration},
+                    })
+                    image_dir = out_dir / "figures" / entry["method"].replace("/", "_")
+                    image_dir.mkdir(parents=True, exist_ok=True)
+                    old_cwd = os.getcwd()
+                    os.chdir(image_dir)
+                    try:
+                        visualize_recon(
+                            forward_op,
+                            forward_op.unnormalize(recon).cpu(),
+                            forward_op.unnormalize(target).cpu(),
+                            sample_idx,
+                            cfg,
+                        )
+                    finally:
+                        os.chdir(old_cwd)
+            except Exception as exc:
+                row["failed"] = True
+                row["error"] = repr(exc)
+                row["runtime_s"] = time.perf_counter() - start
+
+            status_str = f"[FAILED: {row.get('error', 'unknown')}]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
+            print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
+                  f"{status_str} DataMisfit={row.get('data_misfit', 0.0):.3e} Time={row['runtime_s']:.1f}s")
 
     return row
 
@@ -691,6 +864,8 @@ def parse_args():
     parser.add_argument("--pattern", default="random")
     parser.add_argument("--mask-seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
+                        help="If given, run each method/sample for every seed and pool the rows.")
     parser.add_argument("--slice-offset", type=int, default=0)
     parser.add_argument("--val-slices", type=int, default=2)
     parser.add_argument("--test-slices", type=int, default=3)
@@ -701,7 +876,8 @@ def parse_args():
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
                                  "pdaps_ablations", "pdaps_remediation",
-                                 "pdaps_targeted", "warm_sweep"),
+                                 "pdaps_targeted", "pdaps_mechanism",
+                                 "pdaps_nullspace_focus", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
@@ -740,12 +916,15 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
     with open(out_dir / "grid.json", "w") as f:
         json.dump(entries, f, indent=2)
 
+    seed_values = list(args.seeds) if getattr(args, "seeds", None) else [args.seed]
     val_rows = []
     for entry in entries:
-        for idx, filename, sample in val_samples:
-            val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir,
-                                    filename=filename))
-            write_csv(out_dir / "validation_raw.csv", val_rows)
+        for seed in seed_values:
+            args.seed = int(seed)
+            for idx, filename, sample in val_samples:
+                val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir,
+                                        filename=filename))
+                write_csv(out_dir / "validation_raw.csv", val_rows)
     val_summary = summarize(val_rows)
     write_csv(out_dir / "validation_summary.csv", val_summary)
 
@@ -756,10 +935,12 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
 
     test_rows = []
     for entry in selected_entries:
-        for idx, filename, sample in test_samples:
-            test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
-                                     save_image=True, filename=filename))
-            write_csv(out_dir / "test_raw.csv", test_rows)
+        for seed in seed_values:
+            args.seed = int(seed)
+            for idx, filename, sample in test_samples:
+                test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
+                                         save_image=True, filename=filename))
+                write_csv(out_dir / "test_raw.csv", test_rows)
     write_csv(out_dir / "test_summary.csv", summarize(test_rows))
     print(f"Wrote {out_dir}")
 
@@ -821,6 +1002,7 @@ def run_from_hydra(cfg):
         pattern=cfg.forward_op.get("pattern", "random"),
         mask_seed=int(cfg.forward_op.get("mask_seed", 0)),
         seed=int(validation.get("seed", 123)),
+        seeds=[int(s) for s in validation.get("seeds", [])] or None,
         slice_offset=int(validation.get("slice_offset", 0)),
         val_slices=int(validation.get("val_slices", 2)),
         test_slices=int(validation.get("test_slices", 3)),

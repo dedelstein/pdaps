@@ -36,6 +36,8 @@ class MRIInnerPULA:
         penalty_schedule="lambda",
         penalty_eps=0.0,
         mask_split_eps=1.0,
+        mid_inner_project_every=0,
+        tweedie_reanchor_every=0,
     ):
         self.num_steps = int(num_steps)
         if step_size is None:
@@ -73,7 +75,7 @@ class MRIInnerPULA:
         self.gamma_floor = float(gamma_floor)
         self.gamma_ceiling = float(gamma_ceiling)
         self.precond_mode = str(precond_mode)
-        valid_precond_modes = {"standard", "laplacian", "mask_split"}
+        valid_precond_modes = {"standard", "laplacian", "laplacian_null", "mask_split"}
         if self.precond_mode not in valid_precond_modes:
             raise ValueError(f"Unknown precond_mode: {self.precond_mode}")
         self.noise_rhs_mode = str(noise_rhs_mode)
@@ -90,12 +92,12 @@ class MRIInnerPULA:
                 "and noise_rhs_mode='matched'"
             )
         if (
-            self.precond_mode == "laplacian"
+            self.precond_mode in {"laplacian", "laplacian_null"}
             and self.noise_rhs_mode == "matched"
             and self.noise_mode in {"image_only", "null_only"}
         ):
             raise ValueError(
-                f"noise_mode='{self.noise_mode}' is invalid with precond_mode='laplacian' "
+                f"noise_mode='{self.noise_mode}' is invalid with precond_mode='{self.precond_mode}' "
                 "and noise_rhs_mode='matched'"
             )
         self.penalty_scale = float(penalty_scale)
@@ -107,6 +109,12 @@ class MRIInnerPULA:
         self.mask_split_eps = float(mask_split_eps)
         if self.penalty_scale < 0.0 or self.penalty_eps < 0.0 or self.mask_split_eps <= 0.0:
             raise ValueError("penalty_scale and penalty_eps must be nonnegative; mask_split_eps must be positive")
+        self.mid_inner_project_every = int(mid_inner_project_every)
+        self.tweedie_reanchor_every = int(tweedie_reanchor_every)
+        if self.mid_inner_project_every < 0 or self.tweedie_reanchor_every < 0:
+            raise ValueError("mid_inner_project_every and tweedie_reanchor_every must be nonnegative")
+        if self.mid_inner_project_every > 0 and self.tweedie_reanchor_every > 0:
+            raise ValueError("mid_inner_project_every and tweedie_reanchor_every are mutually exclusive")
 
     def lambdas(self, sigma):
         lam_raw = 1.0 / float(sigma) ** 2
@@ -133,7 +141,7 @@ class MRIInnerPULA:
         return gamma
 
     def effective_alpha(self, lam_raw):
-        if self.precond_mode != "laplacian":
+        if self.precond_mode not in {"laplacian", "laplacian_null"}:
             return 0.0
         if self.penalty_schedule == "constant":
             return self.penalty_scale
@@ -177,10 +185,13 @@ class MRIInnerPULA:
             n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
             ah_n1 = pdaps.AH(n1)
 
-            if self.precond_mode == "laplacian" and self.noise_rhs_mode == "matched":
+            if self.precond_mode in {"laplacian", "laplacian_null"} and self.noise_rhs_mode == "matched":
                 ng_x = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
                 ng_y = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
-                penalty_rhs = math.sqrt(max(alpha_eff, 0.0)) * pdaps.divH(ng_x, ng_y)
+                penalty_rhs = pdaps.divH(ng_x, ng_y)
+                if self.precond_mode == "laplacian_null":
+                    penalty_rhs = pdaps.project_null(penalty_rhs)
+                penalty_rhs = math.sqrt(max(alpha_eff, 0.0)) * penalty_rhs
                 if self.penalty_eps > 0.0:
                     penalty_rhs = penalty_rhs + math.sqrt(self.penalty_eps) * n2
                 if self.noise_mode == "range_only":
@@ -189,7 +200,7 @@ class MRIInnerPULA:
                     noise_rhs = ah_n1 + penalty_rhs
                 else:
                     raise ValueError(
-                        f"noise_mode='{self.noise_mode}' is invalid with precond_mode='laplacian' "
+                        f"noise_mode='{self.noise_mode}' is invalid with precond_mode='{self.precond_mode}' "
                         "and noise_rhs_mode='matched'"
                     )
                 noise = pdaps.solve_precond(
@@ -296,8 +307,8 @@ class MRIInnerPULA:
                 "drift_solve_mean": drift.abs().mean().item(),
                 "noise_solve_max": noise.abs().max().item(),
                 "noise_solve_mean": noise.abs().mean().item(),
-                "lap_drift_max": tensor_max(pdaps.laplacian(drift)) if self.precond_mode == "laplacian" else 0.0,
-                "lap_noise_max": tensor_max(pdaps.laplacian(noise)) if self.precond_mode == "laplacian" else 0.0,
+                "lap_drift_max": tensor_max(pdaps.laplacian(drift)) if self.precond_mode in {"laplacian", "laplacian_null"} else 0.0,
+                "lap_noise_max": tensor_max(pdaps.laplacian(noise)) if self.precond_mode in {"laplacian", "laplacian_null"} else 0.0,
                 "step_drift_max": step_drift.abs().max().item(),
                 "step_drift_mean": step_drift.abs().mean().item(),
                 "step_noise_max": step_noise.abs().max().item(),
@@ -381,6 +392,15 @@ class MRIInnerPULA:
                 if not return_stats:
                     return torch.zeros_like(x)
                 return torch.zeros_like(x), 0.0, 0.0, 0.0
+            if step != self.num_steps - 1:
+                if self.mid_inner_project_every > 0 and (step + 1) % self.mid_inner_project_every == 0:
+                    x_real = pdaps.to_real(x)
+                    x_real = pdaps.net(x_real, torch.as_tensor(sigma, device=x_real.device))
+                    x = pdaps.to_complex(x_real).detach()
+                elif self.tweedie_reanchor_every > 0 and (step + 1) % self.tweedie_reanchor_every == 0:
+                    x_real = pdaps.to_real(x)
+                    x_real = pdaps.net(x_real, torch.as_tensor(sigma, device=x_real.device))
+                    x0hat = pdaps.to_complex(x_real).detach()
         if not return_stats:
             return x.detach()
         return x.detach(), total_cg_iters / max(1, self.num_steps), total_drift / max(1, self.num_steps), total_noise / max(1, self.num_steps)
@@ -489,7 +509,15 @@ class PDAPS(Algo):
             penalty_op=penalty_op,
         )
 
-    def solve_laplacian(self, rhs, alpha, lam_solve=0.0, penalty_eps=0.0, return_iters=False):
+    def solve_laplacian(
+        self,
+        rhs,
+        alpha,
+        lam_solve=0.0,
+        penalty_eps=0.0,
+        null_only_penalty=False,
+        return_iters=False,
+    ):
         # AHA is zero on forward-null directions. lam_solve I damps every
         # direction, including DC where the Laplacian has eigenvalue zero.
         diag = lam_solve + penalty_eps
@@ -497,12 +525,15 @@ class PDAPS(Algo):
             normal_op = lambda v: self.AHA(v) + diag * v
         else:
             normal_op = self.AHA
+        penalty_op = self.laplacian
+        if null_only_penalty:
+            penalty_op = lambda v: self.laplacian(self.project_null(v))
         return self.solve(
             rhs,
             alpha,
             return_iters=return_iters,
             normal_op=normal_op,
-            penalty_op=self.laplacian,
+            penalty_op=penalty_op,
         )
 
     def solve_mask_split(self, rhs, lam, null_rhs=None, mask_split_eps=1.0, return_iters=False):
@@ -550,6 +581,15 @@ class PDAPS(Algo):
                 alpha,
                 lam_solve=lam,
                 penalty_eps=penalty_eps,
+                return_iters=return_iters,
+            )
+        if precond_mode == "laplacian_null":
+            return self.solve_laplacian(
+                rhs,
+                alpha,
+                lam_solve=lam,
+                penalty_eps=penalty_eps,
+                null_only_penalty=True,
                 return_iters=return_iters,
             )
         if precond_mode == "mask_split":
