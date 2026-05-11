@@ -4,6 +4,41 @@ import numpy as np
 from libs.inversebench.training.loss import DynamicRangePSNRLoss, DynamicRangeSSIMLoss
 
 
+def complex_to_chan(x):
+    if torch.is_complex(x):
+        return torch.stack([x.real, x.imag], dim=1)
+    return x
+
+
+def magnitude_image(x):
+    x = x.detach()
+    if torch.is_complex(x):
+        return x.abs()
+    x = x.squeeze()
+    if x.ndim == 3 and x.shape[0] == 2:
+        return (x[0] ** 2 + x[1] ** 2).sqrt()
+    if x.ndim == 4 and x.shape[1] == 2:
+        return torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous()).abs()
+    return x
+
+
+def compute_ssim_nmse(reconstruction, target):
+    dr_ssim = DynamicRangeSSIMLoss()
+    with torch.no_grad():
+        reconstruction = complex_to_chan(reconstruction)
+        target = complex_to_chan(target)
+        if reconstruction.ndim == 3:
+            reconstruction = reconstruction.unsqueeze(0)
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+        ssim_val = 1 - dr_ssim(reconstruction.detach().cpu(), target.detach().cpu()).item()
+        nmse_val = (
+            torch.linalg.norm(reconstruction.detach() - target.detach()).square()
+            / torch.linalg.norm(target.detach()).square().clamp_min(1e-12)
+        ).item()
+    return ssim_val, nmse_val
+
+
 def compute_metrics_dict(forward_op, reconstruction, target, observation):
     dr_psnr = DynamicRangePSNRLoss()
     dr_ssim = DynamicRangeSSIMLoss()
@@ -52,12 +87,10 @@ def compute_metrics(forward_op, reconstruction, target, observation):
     return metrics
 
 
-def visualize_recon(forward_op, final_recon, final_target, batch_idx, cfg):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+def visualize_recon(forward_op, final_recon, final_target, batch_idx, cfg, save_path=None):
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
-    target_img = final_target.squeeze()
-    if target_img.ndim == 3 and target_img.shape[0] == 2:
-        target_img = (target_img[0]**2 + target_img[1]**2).sqrt()
+    target_img = magnitude_image(final_target).squeeze().cpu()
     axes[0].imshow(target_img.numpy(), cmap="gray")
     axes[0].set_title("Ground Truth (MVUE)")
     axes[0].axis("off")
@@ -69,14 +102,21 @@ def visualize_recon(forward_op, final_recon, final_target, batch_idx, cfg):
     axes[1].set_title(f"Mask (R={cfg.forward_op.acceleration_ratio}x)")
     axes[1].axis("off")
 
-    recon_img = final_recon.detach().squeeze()
-    if recon_img.ndim == 3 and recon_img.shape[0] == 2:
-        recon_img = (recon_img[0]**2 + recon_img[1]**2).sqrt()
+    recon_img = magnitude_image(final_recon).squeeze().cpu()
     axes[2].imshow(recon_img.numpy(), cmap="gray")
     axes[2].set_title(f"{cfg.algorithm._target_.split('.')[-1]} Reconstruction")
     axes[2].axis("off")
 
+    denom = target_img.abs().max().clamp_min(1e-12)
+    error_img = (recon_img - target_img).abs() / denom
+    im = axes[3].imshow(error_img.numpy(), cmap="magma")
+    axes[3].set_title("|Error| / max(|Target|)")
+    axes[3].axis("off")
+    fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+
     plt.tight_layout()
-    save_path = f"{cfg.algorithm._target_.split('.')[-1]}_recon_batch_{batch_idx}.png"
+    if save_path is None:
+        save_path = f"{cfg.algorithm._target_.split('.')[-1]}_recon_batch_{batch_idx}.png"
     plt.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
     print(f"Saved {save_path}")

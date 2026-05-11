@@ -100,6 +100,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_mechanism_grid(log_level=log_level)
     if preset == "pdaps_nullspace_focus":
         return _pdaps_nullspace_focus_grid(log_level=log_level)
+    if preset == "pdaps_v2":
+        return _pdaps_v2_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -257,7 +259,10 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 penalty_scale=1.0, penalty_schedule="lambda", penalty_eps=0.0,
                 mask_split_eps=1.0,
                 mid_inner_project_every=0, tweedie_reanchor_every=0,
-                edm_project_post=False, label_suffix=""):
+                reanchor_blend_beta=1.0,
+                edm_project_post=False, warm_init_strategy="previous",
+                inner_gate_mode="sigma", residual_threshold=0.3,
+                label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
         "gamma": gamma, "warm_fraction": warm_fraction,
@@ -297,8 +302,15 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         params["mid_inner_project_every"] = int(mid_inner_project_every)
     if tweedie_reanchor_every > 0:
         params["tweedie_reanchor_every"] = int(tweedie_reanchor_every)
+    if reanchor_blend_beta != 1.0:
+        params["reanchor_blend_beta"] = float(reanchor_blend_beta)
     if edm_project_post:
         params["edm_proj"] = True
+    if warm_init_strategy != "previous":
+        params["warm_init_strategy"] = warm_init_strategy
+    if inner_gate_mode != "sigma":
+        params["inner_gate_mode"] = inner_gate_mode
+        params["residual_threshold"] = float(residual_threshold)
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
     lgvd_config = {
         "num_steps": int(lgvd_num_steps),
@@ -317,6 +329,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "mask_split_eps": float(mask_split_eps),
         "mid_inner_project_every": int(mid_inner_project_every),
         "tweedie_reanchor_every": int(tweedie_reanchor_every),
+        "reanchor_blend_beta": float(reanchor_blend_beta),
     }
     if gamma_floor > 0.0:
         lgvd_config["gamma_floor"] = float(gamma_floor)
@@ -340,6 +353,9 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "warm_fraction": warm_fraction,
             "inner_sigma_max": inner_sigma_max,
             "edm_project_post": bool(edm_project_post),
+            "warm_init_strategy": warm_init_strategy,
+            "inner_gate_mode": inner_gate_mode,
+            "residual_threshold": float(residual_threshold),
             "log_level": log_level,
         },
     }
@@ -696,6 +712,85 @@ def _pdaps_nullspace_focus_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v2_grid(log_level="INFO"):
+    """
+    Single-slice follow-up ablation grid.
+
+    This intentionally keeps all requested cells, including duplicate baseline
+    controls under distinct labels, so failures and redundant points are visible
+    in the output matrix.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.5,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=1.0,
+        noise_mode="range_only",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    methods.append(cell("v2_01_range_only_warm05"))
+
+    for label, lam_floor in (("0p1", 0.1), ("0p3", 0.3), ("1", 1.0), ("3", 3.0)):
+        methods.append(cell(f"v2_lam_floor_{label}_warm05", lam_floor=lam_floor))
+
+    methods.append(cell("v2_lam0p3_warm07", lam_floor=0.3, warm_fraction=0.7))
+    methods.append(cell("v2_lam0p3_warm03", lam_floor=0.3, warm_fraction=0.3))
+
+    for label, inner_sigma_max in (("3", 3.0), ("7", 7.0), ("10", 10.0)):
+        methods.append(cell(f"v2_inner_sigma_{label}", inner_sigma_max=inner_sigma_max))
+
+    methods.append(cell("v2_warm07", warm_fraction=0.7))
+    methods.append(cell("v2_warm09", warm_fraction=0.9))
+    methods.append(cell("v2_warm_adaptive05", warm_mode="adaptive", warm_fraction=0.5))
+
+    methods.append(cell("v2_noise_tau0_drift", noise_tau=0.0))
+    methods.append(cell("v2_noise_tau0p25", noise_tau=0.25))
+    methods.append(cell("v2_noise_tau0_warm03", noise_tau=0.0, warm_fraction=0.3))
+
+    methods.append(cell("v2_cgsense_warm_init", warm_init_strategy="cgsense"))
+    methods.append(cell(
+        "v2_residual_gate_thr0p3",
+        inner_gate_mode="residual",
+        residual_threshold=0.3,
+    ))
+    methods.append(cell(
+        "v2_decoupled_lam_target0p3_solve1_noise1",
+        lam_floor=0.0,
+        target_lam_floor=0.3,
+        solve_lam_floor=1.0,
+        noise_lam_floor=1.0,
+    ))
+    methods.append(cell(
+        "v2_light_reanchor50_beta0p1",
+        tweedie_reanchor_every=50,
+        reanchor_blend_beta=0.1,
+    ))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -743,6 +838,11 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
     seeds = getattr(args, "seeds", None)
     seed_suffix = f"_seed{args.seed}" if seeds and len(seeds) > 1 else ""
     log_path = log_dir / f"{sanitized_method}_{split}_{sample_idx}{seed_suffix}.log"
+    trace_path = None
+    if entry["algorithm"]["_target_"] == "algo.pdaps.PDAPS" and args.log_level == "DEBUG":
+        trace_dir = out_dir / "trajectories" / f"accel_{args.acceleration}"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = trace_dir / f"{sanitized_method}_{split}_{sample_idx}{seed_suffix}.npz"
 
     with open(log_path, "w") as log_fh:
         with contextlib.redirect_stdout(_Tee(sys.stdout, log_fh)), contextlib.redirect_stderr(_Tee(sys.stderr, log_fh)):
@@ -755,7 +855,17 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                 observation = forward_op(data)
                 target = data["target"]
 
-                recon = algo.inference(observation, num_samples=1, verbose=args.verbose)
+                if trace_path is not None:
+                    recon = algo.inference(
+                        observation,
+                        num_samples=1,
+                        verbose=args.verbose,
+                        target=target,
+                        trace_path=str(trace_path),
+                    )
+                    row["trajectory_npz"] = str(trace_path)
+                else:
+                    recon = algo.inference(observation, num_samples=1, verbose=args.verbose)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 metrics = compute_metrics_dict(forward_op, recon, target, observation)
@@ -772,8 +882,9 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                         "algorithm": {"_target_": entry["algorithm"]["_target_"]},
                         "forward_op": {"acceleration_ratio": args.acceleration},
                     })
-                    image_dir = out_dir / "figures" / entry["method"].replace("/", "_")
+                    image_dir = out_dir / "figures" / f"accel_{args.acceleration}" / entry["method"].replace("/", "_")
                     image_dir.mkdir(parents=True, exist_ok=True)
+                    image_path = image_dir / f"{split}_{sample_idx}{seed_suffix}.png"
                     old_cwd = os.getcwd()
                     os.chdir(image_dir)
                     try:
@@ -783,7 +894,9 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                             forward_op.unnormalize(target).cpu(),
                             sample_idx,
                             cfg,
+                            save_path=image_path.name,
                         )
+                        row["figure_path"] = str(image_path)
                     finally:
                         os.chdir(old_cwd)
             except Exception as exc:
@@ -833,6 +946,74 @@ def summarize(rows):
     return sorted(out, key=lambda row: (row["method"], -row.get("psnr_mean", -1e9)))
 
 
+def expand_params_rows(rows):
+    expanded = []
+    for row in rows:
+        out = dict(row)
+        try:
+            params = json.loads(row.get("params_json", "{}"))
+        except json.JSONDecodeError:
+            params = {}
+        for key, value in params.items():
+            out[f"params.{key}"] = value
+        expanded.append(out)
+    return expanded
+
+
+def write_ablation_artifacts(out_dir, val_rows, test_rows):
+    combined = []
+    for row in val_rows:
+        combined.append(dict(row))
+    for row in test_rows:
+        combined.append(dict(row))
+    expanded = expand_params_rows(combined)
+    write_csv(out_dir / "ablation_table.csv", expanded)
+
+    failures = [row for row in expanded if row.get("failed")]
+    if failures:
+        write_csv(out_dir / "failure_table.csv", failures)
+    else:
+        fields = sorted({key for row in expanded for key in row}) or ["failed"]
+        with open(out_dir / "failure_table.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+
+    test_summary = summarize(test_rows)
+    write_csv(out_dir / "ablation_test_summary.csv", test_summary)
+    print("Ablation test summary:")
+    for row in test_summary:
+        print(
+            f"  {row['method']}: n_ok={row['n_ok']}/{row['n']} "
+            f"PSNR={row.get('psnr_mean', float('nan')):.3f} "
+            f"SSIM={row.get('ssim_mean', float('nan')):.4f} "
+            f"NMSE={row.get('nmse_mean', float('nan')):.5f} "
+            f"fail={row['failure_rate']:.3f}"
+        )
+
+
+def read_csv_rows(path):
+    if not path.exists():
+        return []
+    with open(path, newline="") as f:
+        rows = []
+        for row in csv.DictReader(f):
+            if "failed" in row:
+                row["failed"] = str(row["failed"]).lower() == "true"
+            rows.append(row)
+        return rows
+
+
+def write_combined_acceleration_artifacts(out_dir, accelerations):
+    val_rows = []
+    test_rows = []
+    for accel in accelerations:
+        sub_dir = out_dir / f"accel_{accel}"
+        val_rows.extend(read_csv_rows(sub_dir / "validation_raw.csv"))
+        test_rows.extend(read_csv_rows(sub_dir / "test_raw.csv"))
+    if val_rows or test_rows:
+        write_ablation_artifacts(out_dir, val_rows, test_rows)
+
+
 def select_best(validation_summary):
     best = {}
     for row in validation_summary:
@@ -869,15 +1050,22 @@ def parse_args():
     parser.add_argument("--slice-offset", type=int, default=0)
     parser.add_argument("--val-slices", type=int, default=2)
     parser.add_argument("--test-slices", type=int, default=3)
+    parser.add_argument("--test-same-as-val", action="store_true",
+                        help="Reuse validation samples as the test split. Useful for single-slice ablations.")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="VAL")
+    parser.add_argument("--evaluate-all", action="store_true",
+                        help="Run every grid entry on the test split instead of validation-selected entries.")
+    parser.add_argument("--save-images", action="store_true",
+                        help="Save reconstruction figures for validation rows as well as test rows.")
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
-                                 "pdaps_nullspace_focus", "warm_sweep"),
+                                 "pdaps_nullspace_focus", "pdaps_v2",
+                                 "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
@@ -923,15 +1111,21 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
             args.seed = int(seed)
             for idx, filename, sample in val_samples:
                 val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir,
+                                        save_image=(args.evaluate_all or args.save_images),
                                         filename=filename))
                 write_csv(out_dir / "validation_raw.csv", val_rows)
     val_summary = summarize(val_rows)
     write_csv(out_dir / "validation_summary.csv", val_summary)
 
-    selected = select_best(val_summary)
-    selected_entries = [entry for entry in entries if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)]
-    with open(out_dir / "selected.json", "w") as f:
-        json.dump(selected, f, indent=2)
+    if args.evaluate_all:
+        selected_entries = entries
+        with open(out_dir / "evaluation_plan.json", "w") as f:
+            json.dump({"mode": "evaluate_all", "num_entries": len(entries)}, f, indent=2)
+    else:
+        selected = select_best(val_summary)
+        selected_entries = [entry for entry in entries if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)]
+        with open(out_dir / "selected.json", "w") as f:
+            json.dump(selected, f, indent=2)
 
     test_rows = []
     for entry in selected_entries:
@@ -942,11 +1136,15 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
                                          save_image=True, filename=filename))
                 write_csv(out_dir / "test_raw.csv", test_rows)
     write_csv(out_dir / "test_summary.csv", summarize(test_rows))
+    if args.evaluate_all:
+        write_ablation_artifacts(out_dir, val_rows, test_rows)
     print(f"Wrote {out_dir}")
 
 
 def run_validation(args):
     entries = method_grid(args.grid_preset, log_level=args.log_level)
+    if args.grid_preset == "pdaps_v2":
+        args.evaluate_all = True
     methods_filter = getattr(args, "methods", None)
     if methods_filter:
         wanted = {m.strip() for m in methods_filter.split(",") if m.strip()}
@@ -970,6 +1168,8 @@ def run_validation(args):
     dataset = MultiCoilMRIDataset(args.kspace_dir, args.maps_dir, args.image_size, filenames=files)
     val_samples, test_samples = _select_samples(dataset, args.slice_offset,
                                                 args.val_slices, args.test_slices)
+    if getattr(args, "test_same_as_val", False):
+        test_samples = list(val_samples)
     print(f"Selected {len(val_samples)} val + {len(test_samples)} test slices "
           f"across {len(files)} file(s) "
           f"({args.val_slices} val + {args.test_slices} test per file).")
@@ -984,6 +1184,8 @@ def run_validation(args):
             sub_dir = out_dir / f"accel_{accel}"
             print(f"=== acceleration {accel}x → {sub_dir} ===")
             _run_one_acceleration(args, entries, net, val_samples, test_samples, sub_dir)
+        if args.evaluate_all:
+            write_combined_acceleration_artifacts(out_dir, accelerations)
     return out_dir
 
 
@@ -1006,12 +1208,15 @@ def run_from_hydra(cfg):
         slice_offset=int(validation.get("slice_offset", 0)),
         val_slices=int(validation.get("val_slices", 2)),
         test_slices=int(validation.get("test_slices", 3)),
+        test_same_as_val=bool(validation.get("test_same_as_val", False)),
         out_dir=validation.get("out_dir", None),
         verbose=bool(validation.get("verbose", False)),
         list_grid=bool(validation.get("list_grid", False)),
         grid_preset=validation.get("grid_preset", "tiny"),
         methods=validation.get("methods", None),
         log_level=validation.get("log_level", "VAL"),
+        evaluate_all=bool(validation.get("evaluate_all", False)),
+        save_images=bool(validation.get("save_images", False)),
     )
     return run_validation(args)
 

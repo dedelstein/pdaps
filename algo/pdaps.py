@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 import tqdm
 
@@ -7,6 +8,7 @@ from algo.base import Algo
 from algo.pula import conjgrad, mri_A, mri_AH, mri_AHA
 from utils.diffusion import DiffusionSampler
 from utils.scheduler import Scheduler
+from utilities import compute_ssim_nmse
 
 
 class MRIInnerPULA:
@@ -38,6 +40,7 @@ class MRIInnerPULA:
         mask_split_eps=1.0,
         mid_inner_project_every=0,
         tweedie_reanchor_every=0,
+        reanchor_blend_beta=1.0,
     ):
         self.num_steps = int(num_steps)
         if step_size is None:
@@ -111,10 +114,13 @@ class MRIInnerPULA:
             raise ValueError("penalty_scale and penalty_eps must be nonnegative; mask_split_eps must be positive")
         self.mid_inner_project_every = int(mid_inner_project_every)
         self.tweedie_reanchor_every = int(tweedie_reanchor_every)
+        self.reanchor_blend_beta = float(reanchor_blend_beta)
         if self.mid_inner_project_every < 0 or self.tweedie_reanchor_every < 0:
             raise ValueError("mid_inner_project_every and tweedie_reanchor_every must be nonnegative")
         if self.mid_inner_project_every > 0 and self.tweedie_reanchor_every > 0:
             raise ValueError("mid_inner_project_every and tweedie_reanchor_every are mutually exclusive")
+        if not 0.0 <= self.reanchor_blend_beta <= 1.0:
+            raise ValueError("reanchor_blend_beta must be in [0, 1]")
 
     def lambdas(self, sigma):
         lam_raw = 1.0 / float(sigma) ** 2
@@ -330,7 +336,19 @@ class MRIInnerPULA:
             return x_next, step_drift.abs().mean().item(), step_noise.abs().mean().item(), cg_drift + cg_noise
         return x_next
 
-    def sample(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, trace_log=None):
+    def sample(
+        self,
+        pdaps,
+        x,
+        x0hat,
+        y,
+        sigma,
+        ratio,
+        return_stats=False,
+        trace_log=None,
+        target=None,
+        trace_records=None,
+    ):
         """
         trace_log: optional dict with keys {"outer": int, "stride": int, "y": tensor}
         — when set, print per-inner-step diagnostics every `stride` steps
@@ -385,6 +403,33 @@ class MRIInnerPULA:
                 total_cg_iters += cg_iters
             else:
                 x = self.step(pdaps, x, x0hat, y, sigma, ratio)
+            if trace_records is not None:
+                x_range = pdaps.project_range(x)
+                x_null = pdaps.project_null(x)
+                range_energy = x_range.abs().square().flatten(start_dim=1).sum(dim=1).mean().item()
+                null_energy = x_null.abs().square().flatten(start_dim=1).sum(dim=1).mean().item()
+                data_residual = pdaps.A(x) - y
+                data_misfit_inner = (
+                    data_residual.abs().square().flatten(start_dim=1).sum(dim=1)
+                    / y.abs().square().flatten(start_dim=1).sum(dim=1).clamp_min(pdaps.eps)
+                ).mean().item()
+                record = {
+                    "outer": int(outer),
+                    "inner": int(step),
+                    "sigma": float(sigma),
+                    "ratio": float(ratio),
+                    "inner_active": 1.0,
+                    "range_energy": range_energy,
+                    "null_energy": null_energy,
+                    "null_range_ratio": null_energy / max(range_energy, pdaps.eps),
+                    "data_misfit_inner": data_misfit_inner,
+                    "x_abs_max": x.abs().max().item(),
+                }
+                if target is not None:
+                    ssim_inner, nmse_inner = compute_ssim_nmse(pdaps.to_real(x), pdaps.to_real(target))
+                    record["ssim_inner"] = ssim_inner
+                    record["nmse_inner"] = nmse_inner
+                trace_records.append(record)
             should_check = self.check_finite and (
                 step == self.num_steps - 1 or (step + 1) % self.finite_check_interval == 0
             )
@@ -400,7 +445,9 @@ class MRIInnerPULA:
                 elif self.tweedie_reanchor_every > 0 and (step + 1) % self.tweedie_reanchor_every == 0:
                     x_real = pdaps.to_real(x)
                     x_real = pdaps.net(x_real, torch.as_tensor(sigma, device=x_real.device))
-                    x0hat = pdaps.to_complex(x_real).detach()
+                    x0hat_new = pdaps.to_complex(x_real).detach()
+                    beta = self.reanchor_blend_beta
+                    x0hat = ((1.0 - beta) * x0hat + beta * x0hat_new).detach()
         if not return_stats:
             return x.detach()
         return x.detach(), total_cg_iters / max(1, self.num_steps), total_drift / max(1, self.num_steps), total_noise / max(1, self.num_steps)
@@ -420,6 +467,9 @@ class PDAPS(Algo):
         eps=1e-8,
         log_level="INFO",
         edm_project_post=False,
+        warm_init_strategy="previous",
+        inner_gate_mode="sigma",
+        residual_threshold=0.3,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -433,6 +483,14 @@ class PDAPS(Algo):
         self.eps = float(eps)
         self.last_gate_stats = []
         self.log_level = log_level
+        self.warm_init_strategy = str(warm_init_strategy)
+        if self.warm_init_strategy not in {"previous", "cgsense", "zero_filled"}:
+            raise ValueError(f"Unknown warm_init_strategy: {self.warm_init_strategy}")
+        self.inner_gate_mode = str(inner_gate_mode)
+        if self.inner_gate_mode not in {"sigma", "residual"}:
+            raise ValueError(f"Unknown inner_gate_mode: {self.inner_gate_mode}")
+        self.residual_threshold = float(residual_threshold)
+        self._warm_init_cache = None
         # edm_project_post: after the inner Langevin produces x_clean, run
         # one Tweedie pass through the EDM denoiser at the *current* outer σ
         # before re-noising. Pulls x_clean back onto the natural-image manifold
@@ -636,23 +694,74 @@ class PDAPS(Algo):
         })
         return alpha.view(-1, 1, 1)
 
+    def cgsense_init(self, y, ref):
+        if self._warm_init_cache is None:
+            self._warm_init_cache = conjgrad(
+                self.AHA,
+                self.AH(y),
+                torch.zeros_like(ref),
+                0.0,
+                20,
+                x_is_zero=True,
+            ).detach()
+        return self._warm_init_cache
+
     def init_inner(self, x_prev, x0hat, y):
-        if x_prev is None or self.warm_mode == "none" or self.warm_fraction <= 0.0:
+        if self.warm_mode == "none" or self.warm_fraction <= 0.0:
             return x0hat
+        warm_source = x_prev
+        if warm_source is None:
+            if self.warm_init_strategy == "cgsense":
+                warm_source = self.cgsense_init(y, x0hat)
+            elif self.warm_init_strategy == "zero_filled":
+                warm_source = self.AH(y)
+            else:
+                return x0hat
         if self.warm_mode == "fixed":
             alpha = self.warm_fraction
         elif self.warm_mode == "adaptive":
-            alpha = self.adaptive_alpha(x_prev, x0hat, y)
+            alpha = self.adaptive_alpha(warm_source, x0hat, y)
         else:
             raise ValueError(f"Unknown warm_mode: {self.warm_mode}")
-        return alpha * x_prev + (1.0 - alpha) * x0hat
+        return alpha * warm_source + (1.0 - alpha) * x0hat
+
+    def inner_gate_active(self, sigma, resid_pre):
+        if self.inner_gate_mode == "sigma":
+            return sigma <= self.inner_sigma_max
+        return resid_pre <= self.residual_threshold
+
+    @staticmethod
+    def write_trace_npz(trace_path, records):
+        if not records:
+            return
+        numeric_keys = sorted({key for row in records for key in row})
+        arrays = {}
+        for key in numeric_keys:
+            vals = []
+            numeric = True
+            for row in records:
+                val = row.get(key, np.nan)
+                if isinstance(val, (int, float, bool, np.number)):
+                    vals.append(float(val))
+                else:
+                    numeric = False
+                    break
+            if numeric:
+                arrays[key] = np.asarray(vals, dtype=np.float64)
+        np.savez_compressed(trace_path, **arrays)
 
     @torch.no_grad()
-    def inference(self, observation, num_samples=1, verbose=True):
+    def inference(self, observation, num_samples=1, verbose=True, target=None, trace_path=None):
         device = self.forward_op.device
         y = torch.view_as_complex(observation).to(device)
         if num_samples > 1:
             y = y.expand(num_samples, -1, -1, -1)
+        target_complex = None
+        if target is not None:
+            target = target.to(device)
+            if target.ndim == 3:
+                target = target.unsqueeze(0)
+            target_complex = self.to_complex(target)
 
         xt = torch.randn(
             num_samples,
@@ -663,10 +772,12 @@ class PDAPS(Algo):
         ) * self.annealing.sigma_max
 
         x_prev = None
+        self._warm_init_cache = None
         self.last_gate_stats = []
+        trace_records = [] if trace_path is not None else None
         N = self.annealing.num_steps
         if self.log_level in ["INFO", "DEBUG"]:
-            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}")
+            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}")
         
         disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
         steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
@@ -680,11 +791,32 @@ class PDAPS(Algo):
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
 
             # Pre-inner residual (what the inner correction starts from).
-            resid_pre = self.residual_norm(x0hat, y).mean().item() if self.log_level == "DEBUG" else None
+            resid_pre = self.residual_norm(x0hat, y).mean().item()
 
-            if sigma > self.inner_sigma_max:
+            inner_active = self.inner_gate_active(float(sigma), resid_pre)
+            if not inner_active:
                 x_clean = x0hat
                 inner_stats = ""
+                if trace_records is not None:
+                    record = {
+                        "outer": int(i),
+                        "inner": -1.0,
+                        "sigma": float(sigma),
+                        "ratio": float(i / max(1, N)),
+                        "inner_active": 0.0,
+                        "resid_pre": float(resid_pre),
+                    }
+                    if target_complex is not None:
+                        ssim_inner, nmse_inner = compute_ssim_nmse(self.to_real(x_clean), self.to_real(target_complex))
+                        record["ssim_inner"] = ssim_inner
+                        record["nmse_inner"] = nmse_inner
+                    trace_records.append(record)
+                if self.log_level == "DEBUG" and self.inner_gate_mode == "residual":
+                    print(
+                        f"[P-DAPS]   inner gate skip outer={i:3d} resid_pre={resid_pre:.3e} "
+                        f"threshold={self.residual_threshold:.3e}",
+                        flush=True,
+                    )
             else:
                 x_init = self.init_inner(x_prev, x0hat, y)
                 if self.log_level == "DEBUG":
@@ -692,11 +824,15 @@ class PDAPS(Algo):
                     x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
                         self, x_init, x0hat, y, sigma, i / max(1, N),
                         return_stats=True, trace_log=trace_log,
+                        target=target_complex, trace_records=trace_records,
                     )
                     inner_dist = (x_clean - x0hat).abs().mean().item()
                     inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
                 else:
-                    x_clean = self.inner.sample(self, x_init, x0hat, y, sigma, i / max(1, N))
+                    x_clean = self.inner.sample(
+                        self, x_init, x0hat, y, sigma, i / max(1, N),
+                        target=target_complex, trace_records=trace_records,
+                    )
                     inner_stats = ""
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5 or i >= N - 3:
@@ -758,6 +894,8 @@ class PDAPS(Algo):
                 x_clean + math.sqrt(2.0) * torch.randn_like(x_clean) * self.annealing.sigma_steps[i + 1]
             )
 
+        if trace_path is not None:
+            self.write_trace_npz(trace_path, trace_records)
         return xt.float()
 
 
