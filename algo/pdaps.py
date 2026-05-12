@@ -798,6 +798,7 @@ class PDAPS(Algo):
                 x_clean = x0hat
                 inner_stats = ""
                 if trace_records is not None:
+                    null_idx = self.nullspace_energy(x_clean).mean().item()
                     record = {
                         "outer": int(i),
                         "inner": -1.0,
@@ -805,6 +806,12 @@ class PDAPS(Algo):
                         "ratio": float(i / max(1, N)),
                         "inner_active": 0.0,
                         "resid_pre": float(resid_pre),
+                        "resid": float(resid_pre),
+                        "null_idx": float(null_idx),
+                        "inner_null_growth": 1.0,
+                        "total_growth": 1.0,
+                        "meas_growth": 1.0,
+                        "inner_dist": 0.0,
                     }
                     if target_complex is not None:
                         ssim_inner, nmse_inner = compute_ssim_nmse(self.to_real(x_clean), self.to_real(target_complex))
@@ -859,6 +866,21 @@ class PDAPS(Algo):
                     null_init = self.project_null(x0hat).norm()
                     null_clean = self.project_null(x_clean).norm()
                     inner_null_growth = (null_clean / null_init.clamp_min(self.eps)).item()
+                    if trace_records is not None and inner_active:
+                        trace_records.append({
+                            "outer": int(i),
+                            "inner": -1.0,
+                            "sigma": float(sigma),
+                            "ratio": float(i / max(1, N)),
+                            "inner_active": float(inner_active),
+                            "resid_pre": float(resid_pre),
+                            "resid": float(resid),
+                            "null_idx": float(null_post),
+                            "inner_null_growth": float(inner_null_growth),
+                            "total_growth": float(total_growth),
+                            "meas_growth": float(meas_growth),
+                            "inner_dist": float(inner_dist if inner_active else 0.0),
+                        })
                     floor_flag = " [λ floored]" if lam > lam_raw + 1e-12 else ""
                     msg += (
                         f" resid_pre={resid_pre:.3e} resid={resid:.3e} "

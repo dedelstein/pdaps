@@ -1054,9 +1054,15 @@ def parse_args():
                         help="Reuse validation samples as the test split. Useful for single-slice ablations.")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
+    parser.add_argument("--method-indices", default=None,
+                        help="Comma-separated grid indices/ranges to run after preset construction "
+                             "and --methods filtering, e.g. 0,2,5-8.")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARN", "VAL"], default="VAL")
     parser.add_argument("--evaluate-all", action="store_true",
                         help="Run every grid entry on the test split instead of validation-selected entries.")
+    parser.add_argument("--skip-test", action="store_true",
+                        help="Only run the validation pass. Useful for evaluate-all single-slice ablations "
+                             "where validation and test would be the same samples.")
     parser.add_argument("--save-images", action="store_true",
                         help="Save reconstruction figures for validation rows as well as test rows.")
     parser.add_argument("--grid-preset",
@@ -1070,6 +1076,30 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
     return parser.parse_args()
+
+
+def parse_index_selection(raw, n_entries):
+    selected = []
+    seen = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, stop_s = part.split("-", 1)
+            start, stop = int(start_s), int(stop_s)
+            if stop < start:
+                raise ValueError(f"Invalid descending method index range: {part}")
+            values = range(start, stop + 1)
+        else:
+            values = [int(part)]
+        for idx in values:
+            if idx < 0 or idx >= n_entries:
+                raise ValueError(f"Method index {idx} out of range for {n_entries} entries")
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+    return selected
 
 
 def _select_samples(dataset, slice_offset, val_slices, test_slices):
@@ -1128,15 +1158,23 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
             json.dump(selected, f, indent=2)
 
     test_rows = []
-    for entry in selected_entries:
-        for seed in seed_values:
-            args.seed = int(seed)
-            for idx, filename, sample in test_samples:
-                test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
-                                         save_image=True, filename=filename))
-                write_csv(out_dir / "test_raw.csv", test_rows)
-    write_csv(out_dir / "test_summary.csv", summarize(test_rows))
-    if args.evaluate_all:
+    if args.skip_test:
+        with open(out_dir / "evaluation_plan.json", "w") as f:
+            json.dump({
+                "mode": "validation_only",
+                "num_entries": len(entries),
+                "reason": "skip_test",
+            }, f, indent=2)
+    else:
+        for entry in selected_entries:
+            for seed in seed_values:
+                args.seed = int(seed)
+                for idx, filename, sample in test_samples:
+                    test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
+                                             save_image=True, filename=filename))
+                    write_csv(out_dir / "test_raw.csv", test_rows)
+        write_csv(out_dir / "test_summary.csv", summarize(test_rows))
+    if args.evaluate_all or args.skip_test:
         write_ablation_artifacts(out_dir, val_rows, test_rows)
     print(f"Wrote {out_dir}")
 
@@ -1149,6 +1187,10 @@ def run_validation(args):
     if methods_filter:
         wanted = {m.strip() for m in methods_filter.split(",") if m.strip()}
         entries = [e for e in entries if e["method"] in wanted]
+    method_indices = getattr(args, "method_indices", None)
+    if method_indices:
+        indices = parse_index_selection(method_indices, len(entries))
+        entries = [entries[idx] for idx in indices]
     if args.list_grid:
         print(json.dumps(entries, indent=2))
         return None
@@ -1217,6 +1259,8 @@ def run_from_hydra(cfg):
         log_level=validation.get("log_level", "VAL"),
         evaluate_all=bool(validation.get("evaluate_all", False)),
         save_images=bool(validation.get("save_images", False)),
+        method_indices=validation.get("method_indices", None),
+        skip_test=bool(validation.get("skip_test", False)),
     )
     return run_validation(args)
 
