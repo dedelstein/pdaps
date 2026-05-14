@@ -102,6 +102,10 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_nullspace_focus_grid(log_level=log_level)
     if preset == "pdaps_v2":
         return _pdaps_v2_grid(log_level=log_level)
+    if preset == "pdaps_v3":
+        return _pdaps_v3_grid(log_level=log_level)
+    if preset == "pdaps_v4":
+        return _pdaps_v4_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -262,6 +266,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 reanchor_blend_beta=1.0,
                 edm_project_post=False, warm_init_strategy="previous",
                 inner_gate_mode="sigma", residual_threshold=0.3,
+                annealing_override=None,
                 label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
@@ -341,12 +346,18 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         lgvd_config["solve_lam_floor"] = float(solve_lam_floor)
     if noise_lam_floor is not None:
         lgvd_config["noise_lam_floor"] = float(noise_lam_floor)
+    annealing_scheduler_config = ANNEALING
+    if annealing_override:
+        annealing_scheduler_config = {**ANNEALING, **annealing_override}
+        for key, value in annealing_override.items():
+            params[f"annealing_{key}"] = value
+
     return {
         "method": method_label,
         "params": params,
         "algorithm": {
             "_target_": "algo.pdaps.PDAPS",
-            "annealing_scheduler_config": ANNEALING,
+            "annealing_scheduler_config": annealing_scheduler_config,
             "diffusion_scheduler_config": REVERSE_ODE,
             "lgvd_config": lgvd_config,
             "warm_mode": warm_mode,
@@ -791,6 +802,175 @@ def _pdaps_v2_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v3_grid(log_level="INFO"):
+    """
+    v3 P-DAPS ablation grid centered on tau=0 MAP correction, with targeted
+    Langevin-salvage cells for the thesis Bayesian framing.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.2,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=1.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    methods.append(cell("v3_tau1_anchor", noise_tau=1.0, warm_fraction=0.5))
+    methods.append(cell("v3_baseline"))
+    methods.append(cell("v3_warm0", warm_fraction=0.0))
+    methods.append(cell("v3_warm0p1", warm_fraction=0.1))
+    methods.append(cell("v3_warm0p3", warm_fraction=0.3))
+    methods.append(cell("v3_lam3", lam_floor=3.0))
+    methods.append(cell("v3_lam10", lam_floor=10.0))
+    methods.append(cell("v3_gamma1", gamma=1.0))
+    methods.append(cell(
+        "v3_decoupled_target0p3_solve3",
+        lam_floor=0.0,
+        target_lam_floor=0.3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+    methods.append(cell("v3_edm_project_post", edm_project_post=True))
+    methods.append(cell(
+        "v3_reanchor50_beta0p1",
+        tweedie_reanchor_every=50,
+        reanchor_blend_beta=0.1,
+    ))
+    methods.append(cell("v3_outer300_poly7", annealing_override={"num_steps": 300}))
+    methods.append(cell("v3_tau1_lam10", noise_tau=1.0, lam_floor=10.0))
+    methods.append(cell("v3_tau1_edm_project_post", noise_tau=1.0, edm_project_post=True))
+    methods.append(cell(
+        "v3_tau1_decoupled_target0p3_solve3",
+        noise_tau=1.0,
+        lam_floor=0.0,
+        target_lam_floor=0.3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+
+    return methods
+
+
+def _pdaps_v4_grid(log_level="INFO"):
+    """
+    v4 P-DAPS grid: two targeted experiments motivated by v2/v3 DEBUG analysis.
+
+    Experiment 1 — inner-step budget under noise_tau=0 (drift-only block):
+      The drift-only inner solver converges by ~k=25 of 100 steps; the
+      remaining ~75 steps are idle. This tests whether lgvd20/30/50 match
+      the lgvd=100 baseline at no quality cost.
+
+    Experiment 2 — objective-side λ_target sweep (CG-decoupled):
+      The ~0.18 residual plateau at σ≈5 is a MAP fixed point, not solver
+      non-convergence. Solver knobs (warm_fraction, γ, inner steps) are
+      inert; the only lever is the objective's effective λ_target.
+      solve_lam_floor=3.0 keeps CG well-conditioned throughout; λ_target
+      is swept independently from 0.04 (natural 1/σ² at σ=5) to 1.0.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": 0.002028752174814177, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.2,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=1.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    # Anchor: identical to v3_baseline for direct cross-grid comparison.
+    methods.append(cell("v4_baseline"))
+
+    # Experiment 1: inner-step budget sweep (drift-only block, noise_tau=0).
+    # lgvd=100 is already covered by v4_baseline above.
+    methods.append(cell("v4_lgvd20", lgvd_num_steps=20))
+    methods.append(cell("v4_lgvd30", lgvd_num_steps=30))
+    methods.append(cell("v4_lgvd50", lgvd_num_steps=50))
+
+    # Experiment 2: objective-side λ_target sweep, CG-decoupled.
+    # lam_floor=0.0 removes the unified floor; solve_lam_floor=3.0 keeps
+    # CG conditioning; noise_lam_floor=3.0 is moot under noise_tau=0.
+    # target_lam_floor is the only active lever.
+    #   0.04 ≈ 1/σ² at σ=5 → floor never binds in the active correction window.
+    #   0.3  → in-grid continuity with v3_decoupled_target0p3_solve3.
+    #   1.0  → should reproduce v4_baseline behaviour (λ_target floored at 1).
+    methods.append(cell(
+        "v4_target0p04_solve3",
+        lam_floor=0.0,
+        target_lam_floor=0.04,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+    methods.append(cell(
+        "v4_target0p1_solve3",
+        lam_floor=0.0,
+        target_lam_floor=0.1,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+    methods.append(cell(
+        "v4_target0p3_solve3",
+        lam_floor=0.0,
+        target_lam_floor=0.3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+    methods.append(cell(
+        "v4_target1_solve3",
+        lam_floor=0.0,
+        target_lam_floor=1.0,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+    ))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1053,7 +1233,10 @@ def parse_args():
     parser.add_argument("--test-same-as-val", action="store_true",
                         help="Reuse validation samples as the test split. Useful for single-slice ablations.")
     parser.add_argument("--out-dir", default=None)
-    parser.add_argument("--methods", default=None, help="Comma-separated list of methods to run (e.g. pULA,P-DAPS)")
+    parser.add_argument("--methods", default=None,
+                        help="Comma-separated list of exact methods to run (e.g. pULA,P-DAPS)")
+    parser.add_argument("--methods-include", default=None,
+                        help="Comma-separated method-name substrings to include after preset construction.")
     parser.add_argument("--method-indices", default=None,
                         help="Comma-separated grid indices/ranges to run after preset construction "
                              "and --methods filtering, e.g. 0,2,5-8.")
@@ -1070,8 +1253,8 @@ def parse_args():
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
-                                 "pdaps_nullspace_focus", "pdaps_v2",
-                                 "warm_sweep"),
+                                 "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
+                                 "pdaps_v4", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
@@ -1183,10 +1366,14 @@ def run_validation(args):
     entries = method_grid(args.grid_preset, log_level=args.log_level)
     if args.grid_preset == "pdaps_v2":
         args.evaluate_all = True
-    methods_filter = getattr(args, "methods", None)
-    if methods_filter:
-        wanted = {m.strip() for m in methods_filter.split(",") if m.strip()}
+    exact_methods_filter = getattr(args, "methods", None)
+    if exact_methods_filter:
+        wanted = {m.strip() for m in exact_methods_filter.split(",") if m.strip()}
         entries = [e for e in entries if e["method"] in wanted]
+    include_methods_filter = getattr(args, "methods_include", None)
+    if include_methods_filter:
+        wanted = [m.strip() for m in include_methods_filter.split(",") if m.strip()]
+        entries = [e for e in entries if any(token in e["method"] for token in wanted)]
     method_indices = getattr(args, "method_indices", None)
     if method_indices:
         indices = parse_index_selection(method_indices, len(entries))
