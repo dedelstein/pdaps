@@ -61,6 +61,7 @@ class MRIInnerPULA:
         # 0.0 = drift-only (deterministic preconditioned gradient descent on
         # the data-fidelity + prior regularizer); intermediate = warm Langevin.
         self.noise_tau = float(noise_tau)
+        self.tau = float(tau) if tau is not None else 1.0
         self.noise_mode = str(noise_mode)
         valid_noise_modes = {"full", "range_only", "image_only", "null_only", "none"}
         if self.noise_mode not in valid_noise_modes:
@@ -124,9 +125,10 @@ class MRIInnerPULA:
 
     def lambdas(self, sigma):
         lam_raw = 1.0 / float(sigma) ** 2
+        lam_target_raw = lam_raw * (self.tau ** 2)
         return {
             "raw": lam_raw,
-            "target": max(lam_raw, self.target_lam_floor),
+            "target": max(lam_target_raw, self.target_lam_floor),
             "solve": max(lam_raw, self.solve_lam_floor),
             "noise": max(lam_raw, self.noise_lam_floor),
         }

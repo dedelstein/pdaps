@@ -46,6 +46,8 @@ ANNEALING = {
     "timestep": "poly-7",
 }
 
+DAPS_TAU = 0.002028752174814177
+
 REVERSE_ODE = {
     "num_steps": 5,
     "sigma_min": 0.01,
@@ -106,6 +108,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v3_grid(log_level=log_level)
     if preset == "pdaps_v4":
         return _pdaps_v4_grid(log_level=log_level)
+    if preset == "pdaps_v5":
+        return _pdaps_v5_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -267,12 +271,15 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 edm_project_post=False, warm_init_strategy="previous",
                 inner_gate_mode="sigma", residual_threshold=0.3,
                 annealing_override=None,
+                tau=1.0,
                 label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
         "gamma": gamma, "warm_fraction": warm_fraction,
         "inner_sigma_max": inner_str, "lgvd_num_steps": int(lgvd_num_steps),
     }
+    if tau != 1.0:
+        params["tau"] = float(tau)
     if lam_floor > 0.0:
         params["lam_floor"] = float(lam_floor)
     if target_lam_floor is not None:
@@ -322,6 +329,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "gamma": gamma,
         "cg_iter": 10,
         "lr_min_ratio": 0.01,
+        "tau": float(tau),
         "lam_floor": float(lam_floor),
         "noise_tau": float(noise_tau),
         "noise_mode": noise_mode,
@@ -971,6 +979,103 @@ def _pdaps_v4_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v5_grid(log_level="INFO"):
+    """
+    v5 P-DAPS ablation: validate the τ² objective fix.
+
+    P-DAPS's inner Langevin targets the fixed point AᴴA(x−y) + λ_target·(x−x̂₀) = 0
+    with λ_target = 1/σ².  DAPS uses λ_target = τ²/σ² (τ = DAPS_TAU ≈ 0.002),
+    making P-DAPS's prior anchor ~243k× stronger.  The fix sets tau=DAPS_TAU so
+    λ_target = τ²/σ², matching the DAPS objective.  This grid validates the fix
+    in a clean A/B and characterises the knobs that interact with it.
+
+    Block A — objective A/B (drift-only, γ constant)
+    Block B — γ-schedule sweep on the fix
+    Block C — inner-step budget, rebased on the fix
+    Block D — Langevin-noise sweep on the fix
+    Block E — floor insurance
+    """
+    methods = []
+
+    # Standard DAPS reference.
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": DAPS_TAU, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.2,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=0.0,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    # ── Block A: objective A/B (drift-only, γ constant) ─────────────────────
+    # v4_baseline anchor with unified lam_floor=1.0 for cross-grid comparison.
+    methods.append(cell("v5a_v4baseline_anchor", tau=1.0, lam_floor=1.0,
+                        target_lam_floor=None, solve_lam_floor=None,
+                        noise_lam_floor=None))
+    # The diagnosed bug in clean form: tau=1 → λ_target = 1/σ² (unfloored).
+    methods.append(cell("v5a_tau1_unfloored", tau=1.0))
+    # The fix: tau=DAPS_TAU → λ_target = τ²/σ².
+    methods.append(cell("v5a_taufix", tau=DAPS_TAU))
+
+    # ── Block B: γ-schedule sweep on the fix (drift-only) ──────────────────
+    # (v5a_taufix is the constant-γ arm of this sweep.)
+    methods.append(cell("v5b_taufix_glambda", tau=DAPS_TAU,
+                        gamma_schedule="lambda"))
+    methods.append(cell("v5b_taufix_glambdacap", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap"))
+    methods.append(cell("v5b_taufix_gsqrtlambdacap", tau=DAPS_TAU,
+                        gamma_schedule="sqrt_lambda_cap"))
+
+    # ── Block C: inner-step budget, rebased on the fix ─────────────────────
+    # Pinned to gamma_schedule="lambda_cap"; lgvd=100 is v5b_taufix_glambdacap.
+    methods.append(cell("v5c_taufix_lgvd20", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", lgvd_num_steps=20))
+    methods.append(cell("v5c_taufix_lgvd30", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", lgvd_num_steps=30))
+    methods.append(cell("v5c_taufix_lgvd50", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", lgvd_num_steps=50))
+
+    # ── Block D: Langevin-noise sweep on the fix ───────────────────────────
+    # noise_tau here is P-DAPS's temperature knob, not the DAPS τ².
+    methods.append(cell("v5d_taufix_noise0p025", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", noise_tau=0.025))
+    methods.append(cell("v5d_taufix_noise0p1", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", noise_tau=0.1))
+    methods.append(cell("v5d_taufix_noise1p0", tau=DAPS_TAU,
+                        gamma_schedule="lambda_cap", noise_tau=1.0))
+
+    # ── Block E: floor insurance ───────────────────────────────────────────
+    methods.append(cell("v5e_taufix_floor1em3", tau=DAPS_TAU,
+                        target_lam_floor=1e-3))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1254,7 +1359,7 @@ def parse_args():
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
-                                 "pdaps_v4", "warm_sweep"),
+                                 "pdaps_v4", "pdaps_v5", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
