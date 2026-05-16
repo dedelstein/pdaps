@@ -365,6 +365,7 @@ class MRIInnerPULA:
         stride = trace_log.get("stride", 0) if tracing else 0
         outer = trace_log.get("outer", -1) if tracing else -1
         for step in range(self.num_steps):
+            trace_stats = {}
             log_this = tracing and stride > 0 and (
                 step == 0 or step == self.num_steps - 1 or (step + 1) % stride == 0
             )
@@ -398,6 +399,13 @@ class MRIInnerPULA:
                 total_drift += full_stats['step_drift_mean']
                 total_noise += full_stats['step_noise_mean']
                 total_cg_iters += full_stats['cg_drift'] + full_stats['cg_noise']
+                trace_stats = {
+                    "gamma_eff": float(full_stats["gamma_eff"]),
+                    "step_total_max": float(full_stats["step_total_max"]),
+                    "step_total_over_sigma": float(full_stats["step_total_over_sigma"]),
+                    "step_drift_max": float(full_stats["step_drift_max"]),
+                    "step_noise_max": float(full_stats["step_noise_max"]),
+                }
             elif return_stats:
                 x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio, return_stats=True)
                 total_drift += d_norm
@@ -427,6 +435,7 @@ class MRIInnerPULA:
                     "data_misfit_inner": data_misfit_inner,
                     "x_abs_max": x.abs().max().item(),
                 }
+                record.update(trace_stats)
                 if target is not None:
                     ssim_inner, nmse_inner = compute_ssim_nmse(pdaps.to_real(x), pdaps.to_real(target))
                     record["ssim_inner"] = ssim_inner
@@ -882,6 +891,8 @@ class PDAPS(Algo):
                             "total_growth": float(total_growth),
                             "meas_growth": float(meas_growth),
                             "inner_dist": float(inner_dist if inner_active else 0.0),
+                            "x_abs_max": float(x_clean.abs().max().item()),
+                            "gamma_eff": float(gamma_eff),
                         })
                     floor_flag = " [λ floored]" if lam > lam_raw + 1e-12 else ""
                     msg += (

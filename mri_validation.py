@@ -110,6 +110,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v4_grid(log_level=log_level)
     if preset == "pdaps_v5":
         return _pdaps_v5_grid(log_level=log_level)
+    if preset == "pdaps_v6":
+        return _pdaps_v6_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -1076,6 +1078,103 @@ def _pdaps_v5_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v6_grid(log_level="INFO"):
+    """
+    v6 P-DAPS ablation around the v5 winner.
+
+    Common base is v5b_taufix_glambda:
+      tau=DAPS_TAU, gamma_schedule="lambda", range-only drift/noise path,
+      noise_tau=0, target_lam_floor=0, solve_lam_floor=3, warm_fraction=0.2.
+
+    The grid keeps single-knob deltas for attribution.  Runtime-policy cells
+    (outer/lgvd budget) should be analyzed separately from quality cells; Block B
+    noise cells intentionally stay on the full outer=200 base.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": DAPS_TAU, "lr_min_ratio": 0.01},
+        },
+    })
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.2,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=0.0,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    # Block 0: anchors.
+    methods.append(cell("v6_anchor_glambda"))
+    methods.append(cell("v6_anchor_taufix_const", gamma_schedule="constant"))
+
+    # Block A: schedule and inner budget.
+    methods.append(cell("v6_glambda_outer100", annealing_override={"num_steps": 100}))
+    methods.append(cell("v6_glambda_outer150", annealing_override={"num_steps": 150}))
+    methods.append(cell("v6_glambda_outer300", annealing_override={"num_steps": 300}))
+    methods.append(cell("v6_glambda_lgvd50", lgvd_num_steps=50))
+    methods.append(cell("v6_glambda_lgvd200", lgvd_num_steps=200))
+
+    # Block B: range-only Langevin noise on the full outer=200 base.
+    methods.append(cell("v6_glambda_noise_temp0p005", noise_tau=0.005))
+    methods.append(cell("v6_glambda_noise_temp0p025", noise_tau=0.025))
+    methods.append(cell("v6_glambda_noise_temp0p1", noise_tau=0.1))
+    methods.append(cell("v6_glambda_noise_temp1p0", noise_tau=1.0))
+
+    # Block C: gamma-scale stability/overshoot edge.
+    methods.append(cell("v6_glambda_gamma0p75", gamma=0.75))
+    methods.append(cell("v6_glambda_gamma1p0", gamma=1.0))
+
+    # Block D: initialization and warm anchoring.
+    methods.append(cell("v6_glambda_warm0", warm_fraction=0.0))
+    methods.append(cell("v6_glambda_warm0p5", warm_fraction=0.5))
+    methods.append(cell("v6_glambda_warm0p8", warm_fraction=0.8))
+    methods.append(cell("v6_glambda_warm_adaptive", warm_mode="adaptive", warm_fraction=0.5))
+    methods.append(cell("v6_glambda_cgsense_init", warm_init_strategy="cgsense"))
+
+    # Block E: periodic inner-loop Tweedie reanchor.
+    methods.append(cell("v6_glambda_reanchor50_beta0p1",
+                        tweedie_reanchor_every=50, reanchor_blend_beta=0.1))
+    methods.append(cell("v6_glambda_reanchor25_beta0p1",
+                        tweedie_reanchor_every=25, reanchor_blend_beta=0.1))
+
+    # Block F: gate and solve-floor sweep.  The solve_floor=3 anchor is Block 0.
+    methods.append(cell("v6_glambda_inner_sigma10", inner_sigma_max=10.0))
+    methods.append(cell("v6_glambda_inner_sigma_nogate", inner_sigma_max=1e9))
+    methods.append(cell("v6_glambda_solve_floor1", solve_lam_floor=1.0, noise_lam_floor=1.0))
+    methods.append(cell("v6_glambda_solve_floor5", solve_lam_floor=5.0, noise_lam_floor=5.0))
+    methods.append(cell("v6_glambda_solve_floor10", solve_lam_floor=10.0, noise_lam_floor=10.0))
+
+    # Block G: conditional tiny prior-anchor regularization.  Keep in the grid
+    # so it can be selected by method index only if image inspection warrants it.
+    methods.append(cell("v6_glambda_target_floor_1em3", target_lam_floor=1e-3))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1359,7 +1458,7 @@ def parse_args():
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
-                                 "pdaps_v4", "pdaps_v5", "warm_sweep"),
+                                 "pdaps_v4", "pdaps_v5", "pdaps_v6", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
