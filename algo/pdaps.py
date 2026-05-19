@@ -502,6 +502,7 @@ class PDAPS(Algo):
             raise ValueError(f"Unknown inner_gate_mode: {self.inner_gate_mode}")
         self.residual_threshold = float(residual_threshold)
         self._warm_init_cache = None
+        self._inner_has_run = False
         # edm_project_post: after the inner Langevin produces x_clean, run
         # one Tweedie pass through the EDM denoiser at the *current* outer σ
         # before re-noising. Pulls x_clean back onto the natural-image manifold
@@ -784,6 +785,7 @@ class PDAPS(Algo):
 
         x_prev = None
         self._warm_init_cache = None
+        self._inner_has_run = False
         self.last_gate_stats = []
         trace_records = [] if trace_path is not None else None
         N = self.annealing.num_steps
@@ -836,7 +838,15 @@ class PDAPS(Algo):
                         flush=True,
                     )
             else:
-                x_init = self.init_inner(x_prev, x0hat, y)
+                warm_prev = x_prev
+                if self.warm_init_strategy == "cgsense" and not self._inner_has_run:
+                    warm_prev = None
+                    if self.log_level == "DEBUG":
+                        print(
+                            f"[P-DAPS]   cgsense warm init at first active inner outer={i:3d}",
+                            flush=True,
+                        )
+                x_init = self.init_inner(warm_prev, x0hat, y)
                 if self.log_level == "DEBUG":
                     trace_log = {"outer": i, "stride": inner_log_stride, "y": y} if inner_log_stride > 0 else None
                     x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
@@ -852,6 +862,7 @@ class PDAPS(Algo):
                         target=target_complex, trace_records=trace_records,
                     )
                     inner_stats = ""
+                self._inner_has_run = True
 
             if self.log_level == "DEBUG" or i % 20 == 0 or i < 5 or i >= N - 3:
                 msg = (f"[P-DAPS] outer={i:3d} σ={sigma:.4f} "

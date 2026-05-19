@@ -112,6 +112,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v5_grid(log_level=log_level)
     if preset == "pdaps_v6":
         return _pdaps_v6_grid(log_level=log_level)
+    if preset == "pdaps_v7":
+        return _pdaps_v7_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -1175,6 +1177,98 @@ def _pdaps_v6_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v7_grid(log_level="INFO"):
+    """
+    v7 P-DAPS ablation around the best v6 single-axis settings.
+
+    Base combines gamma=1.0, warm_fraction=0.8, and target_lam_floor=1e-3.
+    The grid keeps one-axis deltas around that base, with DAPS and the v6
+    glambda anchor retained for cross-grid context.
+    """
+    methods = []
+    methods.append({
+        "method": "DAPS",
+        "params": {"lr": 1e-5},
+        "algorithm": {
+            "_target_": "algo.daps.DAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {"num_steps": 100, "lr": 1e-5,
+                            "tau": DAPS_TAU, "lr_min_ratio": 0.01},
+        },
+    })
+
+    v6_anchor = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.2,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=0.0,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+    methods.append(pdaps_entry(**v6_anchor, label_suffix="v6_anchor_glambda"))
+
+    common = dict(v6_anchor)
+    common.update(
+        gamma=1.0,
+        warm_fraction=0.8,
+        target_lam_floor=1e-3,
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        return pdaps_entry(**cfg, label_suffix=label_suffix)
+
+    # Base and winner-combination sanity checks.
+    methods.append(cell("v7_base"))
+    methods.append(cell("v7_base_gamma0p5", gamma=0.5))
+    methods.append(cell("v7_base_warm0p2", warm_fraction=0.2))
+
+    # Anchor-weight sweep.
+    methods.append(cell("v7_target_floor_0", target_lam_floor=0.0))
+    methods.append(cell("v7_target_floor_1em2", target_lam_floor=1e-2))
+
+    # Inner-gate sweep, including gates below the v6 default.
+    methods.append(cell("v7_inner_sigma2", inner_sigma_max=2.0))
+    methods.append(cell("v7_inner_sigma3", inner_sigma_max=3.0))
+    methods.append(cell("v7_inner_sigma10", inner_sigma_max=10.0))
+
+    # Mechanism cells now that the anchor term is no longer effectively zero.
+    methods.append(cell("v7_reanchor25", tweedie_reanchor_every=25, reanchor_blend_beta=0.1))
+    methods.append(cell("v7_reanchor50", tweedie_reanchor_every=50, reanchor_blend_beta=0.1))
+    methods.append(cell("v7_cgsense_init", warm_init_strategy="cgsense"))
+
+    # Efficiency frontier around the gamma=1.0 base.
+    methods.append(cell("v7_outer100_lgvd50",
+                        annealing_override={"num_steps": 100}, lgvd_num_steps=50))
+    methods.append(cell("v7_outer150_lgvd75",
+                        annealing_override={"num_steps": 150}, lgvd_num_steps=75))
+
+    # Solve-floor sweep on the v7 base.
+    methods.append(cell("v7_solve_floor1", solve_lam_floor=1.0, noise_lam_floor=1.0))
+    methods.append(cell("v7_solve_floor5", solve_lam_floor=5.0, noise_lam_floor=5.0))
+
+    # New axes not covered by v6.
+    methods.append(cell("v7_edm_project_post", edm_project_post=True))
+    methods.append(cell("v7_inner_gate_residual",
+                        inner_gate_mode="residual", residual_threshold=0.3))
+    methods.append(cell("v7_precond_laplacian",
+                        precond_mode="laplacian", noise_rhs_mode="matched"))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1458,7 +1552,8 @@ def parse_args():
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
-                                 "pdaps_v4", "pdaps_v5", "pdaps_v6", "warm_sweep"),
+                                 "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
+                                 "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
