@@ -450,15 +450,31 @@ class MRIInnerPULA:
                 return torch.zeros_like(x), 0.0, 0.0, 0.0
             if step != self.num_steps - 1:
                 if self.mid_inner_project_every > 0 and (step + 1) % self.mid_inner_project_every == 0:
+                    x_before = x
                     x_real = pdaps.to_real(x)
                     x_real = pdaps.net(x_real, torch.as_tensor(sigma, device=x_real.device))
                     x = pdaps.to_complex(x_real).detach()
+                    if tracing:
+                        shift = (x - x_before).abs().mean().item()
+                        print(
+                            f"[P-DAPS]   mid_inner_project outer={outer:3d} "
+                            f"k={step:3d}/{self.num_steps} shift={shift:.3e}",
+                            flush=True,
+                        )
                 elif self.tweedie_reanchor_every > 0 and (step + 1) % self.tweedie_reanchor_every == 0:
                     x_real = pdaps.to_real(x)
                     x_real = pdaps.net(x_real, torch.as_tensor(sigma, device=x_real.device))
                     x0hat_new = pdaps.to_complex(x_real).detach()
                     beta = self.reanchor_blend_beta
+                    anchor_shift = (x0hat_new - x0hat).abs().mean().item()
                     x0hat = ((1.0 - beta) * x0hat + beta * x0hat_new).detach()
+                    if tracing:
+                        print(
+                            f"[P-DAPS]   reanchor outer={outer:3d} "
+                            f"k={step:3d}/{self.num_steps} beta={beta:.3g} "
+                            f"anchor_shift={anchor_shift:.3e}",
+                            flush=True,
+                        )
         if not return_stats:
             return x.detach()
         return x.detach(), total_cg_iters / max(1, self.num_steps), total_drift / max(1, self.num_steps), total_noise / max(1, self.num_steps)
@@ -498,7 +514,7 @@ class PDAPS(Algo):
         if self.warm_init_strategy not in {"previous", "cgsense", "zero_filled"}:
             raise ValueError(f"Unknown warm_init_strategy: {self.warm_init_strategy}")
         self.inner_gate_mode = str(inner_gate_mode)
-        if self.inner_gate_mode not in {"sigma", "residual"}:
+        if self.inner_gate_mode not in {"sigma", "residual", "compound"}:
             raise ValueError(f"Unknown inner_gate_mode: {self.inner_gate_mode}")
         self.residual_threshold = float(residual_threshold)
         self._warm_init_cache = None
@@ -740,7 +756,9 @@ class PDAPS(Algo):
     def inner_gate_active(self, sigma, resid_pre):
         if self.inner_gate_mode == "sigma":
             return sigma <= self.inner_sigma_max
-        return resid_pre <= self.residual_threshold
+        if self.inner_gate_mode == "residual":
+            return resid_pre <= self.residual_threshold
+        return sigma <= self.inner_sigma_max and resid_pre <= self.residual_threshold
 
     @staticmethod
     def write_trace_npz(trace_path, records):

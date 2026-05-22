@@ -114,6 +114,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v6_grid(log_level=log_level)
     if preset == "pdaps_v7":
         return _pdaps_v7_grid(log_level=log_level)
+    if preset == "pdaps_v8a":
+        return _pdaps_v8a_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -1269,6 +1271,76 @@ def _pdaps_v7_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8a_grid(log_level="INFO"):
+    """
+    v8a P-DAPS regime map.
+
+    Maps the gamma x Langevin-noise-temperature x noise-subspace surface around
+    the v7 SSIM-best operating point.  This preset intentionally omits DAPS:
+    v8a is a P-DAPS mechanism audit, not a broad algorithm comparison.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    # Drift-only anchors.  noise_mode is irrelevant here because the noise
+    # solve is gated off at noise_tau=0.
+    methods.append(cell("v8a_drift_g0p5", gamma=0.5, noise_tau=0.0))
+    methods.append(cell("v8a_drift_g1p0", gamma=1.0, noise_tau=0.0))
+
+    # Core regime map: turn Langevin noise on and test the measured-subspace
+    # ablation against full image-space noise, including the null component.
+    tau_labels = [(0.025, "0p025"), (0.05, "0p05"), (0.1, "0p1")]
+    mode_labels = [("range_only", "range"), ("full", "full")]
+    for gamma, gamma_label in ((0.5, "0p5"), (1.0, "1p0")):
+        for noise_tau, tau_label in tau_labels:
+            for noise_mode, mode_label in mode_labels:
+                methods.append(cell(
+                    f"v8a_g{gamma_label}_nt{tau_label}_{mode_label}",
+                    gamma=gamma,
+                    noise_tau=noise_tau,
+                    noise_mode=noise_mode,
+                ))
+
+    # Upper-edge range-only probes.  Full noise at this temperature is left to
+    # follow-up if the lower full-noise surface warrants it.
+    methods.append(cell("v8a_g0p5_nt0p2_range", gamma=0.5,
+                        noise_tau=0.2, noise_mode="range_only"))
+    methods.append(cell("v8a_g1p0_nt0p2_range", gamma=1.0,
+                        noise_tau=0.2, noise_mode="range_only"))
+
+    # Current-code bridge to the v6 inherited deterministic base.
+    methods.append(cell("v6_anchor_glambda", gamma=0.5, warm_fraction=0.2,
+                        target_lam_floor=0.0, noise_tau=0.0,
+                        noise_mode="range_only"))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1553,7 +1625,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "warm_sweep"),
+                                 "pdaps_v8a", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
