@@ -116,6 +116,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v7_grid(log_level=log_level)
     if preset == "pdaps_v8a":
         return _pdaps_v8a_grid(log_level=log_level)
+    if preset == "pdaps_v8b":
+        return _pdaps_v8b_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -1341,6 +1343,204 @@ def _pdaps_v8a_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8b_grid(log_level="INFO"):
+    """
+    v8b P-DAPS mechanism-audit grid.
+
+    Pinned to the v8a operating point, this preset audits whether individual
+    noise, gate, reanchor, floor, preconditioner, and projection mechanisms are
+    functional. It intentionally excludes the v8a drift reference; compare
+    against the published v8a_drift_g0p5 metrics instead of re-running it.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    # Block A: rescue full image-space noise by lowering the noise lambda floor.
+    tau_labels = [(0.005, "0p005"), (0.01, "0p01"),
+                  (0.025, "0p025"), (0.05, "0p05")]
+    floor_labels = [(3.0, "3p0"), (1.0, "1p0"),
+                    (0.3, "0p3"), (0.1, "0p1")]
+    for noise_tau, tau_label in tau_labels:
+        for noise_lam_floor, floor_label in floor_labels:
+            methods.append(cell(
+                f"v8b_A_full_nt{tau_label}_lnf{floor_label}",
+                noise_tau=noise_tau,
+                noise_mode="full",
+                noise_lam_floor=noise_lam_floor,
+            ))
+
+    # Block B: compound inner gate residual-threshold sweep under range noise.
+    for residual_threshold, rt_label in (
+        (0.50, "0p50"),
+        (0.30, "0p30"),
+        (0.20, "0p20"),
+        (0.10, "0p10"),
+        (0.08, "0p08"),
+        (0.05, "0p05"),
+    ):
+        methods.append(cell(
+            f"v8b_B_compound_rt{rt_label}_nt0p05_range",
+            noise_tau=0.05,
+            noise_mode="range_only",
+            inner_gate_mode="compound",
+            residual_threshold=residual_threshold,
+        ))
+
+    # Block C: Tweedie reanchor beta sweep plus drift and rescued-full controls.
+    for beta, beta_label in (
+        (0.10, "0p10"),
+        (0.25, "0p25"),
+        (0.50, "0p50"),
+        (1.00, "1p0"),
+    ):
+        methods.append(cell(
+            f"v8b_C_reanchor25_b{beta_label}_nt0p05_range",
+            noise_tau=0.05,
+            noise_mode="range_only",
+            tweedie_reanchor_every=25,
+            reanchor_blend_beta=beta,
+        ))
+    methods.append(cell(
+        "v8b_C_reanchor25_b0p50_drift",
+        noise_tau=0.0,
+        noise_mode="range_only",
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.50,
+    ))
+    methods.append(cell(
+        "v8b_C_reanchor25_b0p50_nt0p025_full_lnf0p3",
+        noise_tau=0.025,
+        noise_mode="full",
+        noise_lam_floor=0.3,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.50,
+    ))
+
+    # Block D: lambda-floor interactions under range noise.
+    methods.append(cell(
+        "v8b_D_tf1em4_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        target_lam_floor=1e-4,
+    ))
+    methods.append(cell(
+        "v8b_D_tf1em2_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        target_lam_floor=1e-2,
+    ))
+    methods.append(cell(
+        "v8b_D_sf1p0_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        solve_lam_floor=1.0,
+    ))
+
+    # Block E: non-standard preconditioners under range and rescued-full noise.
+    for label_prefix, precond_mode in (
+        ("lap", "laplacian"),
+        ("lapnull", "laplacian_null"),
+        ("mask", "mask_split"),
+    ):
+        methods.append(cell(
+            f"v8b_E_{label_prefix}_nt0p05_range",
+            noise_tau=0.05,
+            noise_mode="range_only",
+            precond_mode=precond_mode,
+            noise_rhs_mode="matched",
+        ))
+    for label_prefix, precond_mode in (
+        ("lap", "laplacian"),
+        ("lapnull", "laplacian_null"),
+        ("mask", "mask_split"),
+    ):
+        methods.append(cell(
+            f"v8b_E_{label_prefix}_nt0p025_full_lnf0p3",
+            noise_tau=0.025,
+            noise_mode="full",
+            noise_lam_floor=0.3,
+            precond_mode=precond_mode,
+            noise_rhs_mode="matched",
+        ))
+
+    # Block F: under-exercised warm, mid-project, and EDM post-project knobs.
+    methods.append(cell(
+        "v8b_F_adaptive_warm_nt0p05_range",
+        warm_mode="adaptive",
+        noise_tau=0.05,
+        noise_mode="range_only",
+    ))
+    methods.append(cell(
+        "v8b_F_midproj25_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        mid_inner_project_every=25,
+    ))
+    methods.append(cell(
+        "v8b_F_edmpost_drift_g0p5",
+        noise_tau=0.0,
+        noise_mode="range_only",
+        edm_project_post=True,
+    ))
+    methods.append(cell(
+        "v8b_F_edmpost_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        edm_project_post=True,
+    ))
+    methods.append(cell(
+        "v8b_F_adaptive_warm_nt0p025_full_lnf0p3",
+        warm_mode="adaptive",
+        noise_tau=0.025,
+        noise_mode="full",
+        noise_lam_floor=0.3,
+    ))
+
+    # Block G: pure null-space and pure image-space completeness probes.
+    for mode_label, noise_mode in (("nullonly", "null_only"),
+                                  ("imageonly", "image_only")):
+        for noise_tau, tau_label, noise_lam_floor, floor_label in (
+            (0.05, "0p05", 3.0, "3p0"),
+            (0.05, "0p05", 0.3, "0p3"),
+            (0.05, "0p05", 0.1, "0p1"),
+            (0.01, "0p01", 3.0, "3p0"),
+        ):
+            methods.append(cell(
+                f"v8b_G_{mode_label}_nt{tau_label}_lnf{floor_label}",
+                noise_tau=noise_tau,
+                noise_mode=noise_mode,
+                noise_lam_floor=noise_lam_floor,
+            ))
+
+    return methods
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1625,7 +1825,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "warm_sweep"),
+                                 "pdaps_v8a", "pdaps_v8b", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
