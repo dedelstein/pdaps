@@ -964,11 +964,15 @@ class PDAPS(Algo):
                     )
             else:
                 warm_prev = x_prev
-                if self.warm_init_strategy == "cgsense" and not self._inner_has_run:
+                if (
+                    self.warm_init_strategy in {"cgsense", "zero_filled"}
+                    and not self._inner_has_run
+                ):
                     warm_prev = None
                     if self.log_level == "DEBUG":
                         print(
-                            f"[P-DAPS]   cgsense warm init at first active inner outer={i:3d}",
+                            f"[P-DAPS]   {self.warm_init_strategy} warm init at first "
+                            f"active inner outer={i:3d}",
                             flush=True,
                         )
                 x_init = self.init_inner(warm_prev, x0hat, y)

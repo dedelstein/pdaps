@@ -118,6 +118,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8a_grid(log_level=log_level)
     if preset == "pdaps_v8b":
         return _pdaps_v8b_grid(log_level=log_level)
+    if preset == "check_abandoned":
+        return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
         return _pdaps_bugcheck_grid(log_level=log_level)
     if preset == "pdaps_targeted":
@@ -1562,6 +1564,309 @@ def _pdaps_v8b_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_check_abandoned_grid(log_level="INFO"):
+    """
+    Post-v8b audit grid for live knobs and crosses not covered by v8c.
+
+    Pinned to the v8a operating point.  The v8a drift reference is cited, not
+    re-run; compare drift cells against v8a_drift_g0p5.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    # Block H: gamma shape knobs never landed in prior grids.
+    methods.append(cell("H_gfloor0p05", gamma_floor=0.05))
+    methods.append(cell("H_gceil0p5_g0p5", gamma_ceiling=0.5))
+    methods.append(cell("H_gceil0p5_g1p0", gamma=1.0, gamma_ceiling=0.5))
+    methods.append(cell("H_gceil1p0_g1p0", gamma=1.0, gamma_ceiling=1.0))
+    methods.append(cell("H_sqrtlambda_g0p5", gamma_schedule="sqrt_lambda"))
+    methods.append(cell("H_sqrtlambda_g1p0", gamma=1.0, gamma_schedule="sqrt_lambda"))
+
+    # Block I: warm-init alternatives.
+    methods.append(cell("I_zerofilled_warm0p8_drift", warm_init_strategy="zero_filled"))
+    methods.append(cell(
+        "I_zerofilled_warm0p5_drift",
+        warm_fraction=0.5,
+        warm_init_strategy="zero_filled",
+    ))
+    methods.append(cell(
+        "I_zerofilled_warm0p8_nt0p05_range",
+        warm_init_strategy="zero_filled",
+        noise_tau=0.05,
+    ))
+    methods.append(cell("I_cgsense_diag", warm_init_strategy="cgsense"))
+
+    # Block J: late-only noise gates with noise-only semantics.
+    methods.append(cell(
+        "J_noisegate_residual_0p20_nt0p05_range",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.20,
+    ))
+    methods.append(cell(
+        "J_noisegate_residual_0p10_nt0p05_range",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "J_noisegate_residual_0p05_nt0p05_range",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.05,
+    ))
+    methods.append(cell(
+        "J_noisegate_compound_resid0p10_nt0p05_range",
+        noise_tau=0.05,
+        noise_gate_mode="compound",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "J_noisegate_residual_0p10_nt0p1_range",
+        noise_tau=0.10,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+
+    # Block K: mid-inner project at unexplored strides / under drift.
+    methods.append(cell("K_midproj50_drift", mid_inner_project_every=50))
+    methods.append(cell("K_midproj10_drift", mid_inner_project_every=10))
+    methods.append(cell("K_midproj25_drift", mid_inner_project_every=25))
+    methods.append(cell(
+        "K_midproj50_nt0p05_range",
+        noise_tau=0.05,
+        mid_inner_project_every=50,
+    ))
+
+    # Block L: Tweedie reanchor at unexplored conditions.
+    methods.append(cell(
+        "L_reanchor50_b0p5_drift",
+        tweedie_reanchor_every=50,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "L_reanchor10_b0p5_drift",
+        tweedie_reanchor_every=10,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "L_reanchor25_b0p5_nt0p1_range",
+        noise_tau=0.10,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "L_reanchor25_b0p5_adaptive_warm_nt0p05_range",
+        warm_mode="adaptive",
+        noise_tau=0.05,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+
+    # Block M: gamma x warm cross corners.
+    methods.append(cell("M_g0p5_warm0p5", warm_fraction=0.5))
+    methods.append(cell("M_g1p0_warm0p5", gamma=1.0, warm_fraction=0.5))
+    methods.append(cell("M_g0p75_warm0p8", gamma=0.75))
+    methods.append(cell("M_g0p75_warm0p5", gamma=0.75, warm_fraction=0.5))
+
+    # Block N: outer x LGVD frontier at v8a gamma=0.5.
+    methods.append(cell(
+        "N_outer100_lgvd50_g0p5",
+        lgvd_num_steps=50,
+        annealing_override={"num_steps": 100},
+    ))
+    methods.append(cell(
+        "N_outer150_lgvd75_g0p5",
+        lgvd_num_steps=75,
+        annealing_override={"num_steps": 150},
+    ))
+    methods.append(cell(
+        "N_outer150_lgvd100_g0p5",
+        lgvd_num_steps=100,
+        annealing_override={"num_steps": 150},
+    ))
+
+    # Block O: opened inner gate with capped per-step magnitude.
+    methods.append(cell(
+        "O_inner_sigma10_gceil0p5",
+        inner_sigma_max=10.0,
+        gamma_ceiling=0.5,
+    ))
+    methods.append(cell(
+        "O_inner_sigma_nogate_gceil0p5",
+        inner_sigma_max=1e9,
+        gamma_ceiling=0.5,
+    ))
+
+    # Block P: Laplacian / Laplacian-null under unexplored knobs.
+    methods.append(cell(
+        "P_lapnull_drift",
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+    ))
+    methods.append(cell(
+        "P_lapnull_nt0p05_range_warm0p2",
+        warm_fraction=0.2,
+        noise_tau=0.05,
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+    ))
+    methods.append(cell(
+        "P_lapnull_nt0p05_range_gceil0p5",
+        noise_tau=0.05,
+        gamma_ceiling=0.5,
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+    ))
+    methods.append(cell(
+        "P_lapnull_pen100_matched_nt0p05_range",
+        noise_tau=0.05,
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        penalty_scale=100.0,
+    ))
+    methods.append(cell(
+        "P_lap_pen100_matched_drift",
+        precond_mode="laplacian",
+        noise_rhs_mode="matched",
+        penalty_scale=100.0,
+    ))
+
+    # Block Q: high-information two-knob crosses.
+    methods.append(cell(
+        "Q_gceil0p5_g1p0_nt0p05_range",
+        gamma=1.0,
+        gamma_ceiling=0.5,
+        noise_tau=0.05,
+    ))
+    methods.append(cell(
+        "Q_noisegate_residual_0p10_reanchor25_b0p5_nt0p05_range",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "Q_adaptive_warm_noisegate_residual_0p10_nt0p05_range",
+        warm_mode="adaptive",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "Q_gceil0p5_g1p0_noisegate_residual_0p10_nt0p05_range",
+        gamma=1.0,
+        gamma_ceiling=0.5,
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "Q_reanchor25_b0p5_gceil0p5_g1p0_drift",
+        gamma=1.0,
+        gamma_ceiling=0.5,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "Q_midproj25_gceil0p5_g1p0_drift",
+        gamma=1.0,
+        gamma_ceiling=0.5,
+        mid_inner_project_every=25,
+    ))
+    methods.append(cell(
+        "Q_adaptive_warm_reanchor25_b0p5_nt0p05_range",
+        warm_mode="adaptive",
+        noise_tau=0.05,
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "Q_lapnull_noisegate_residual_0p10_nt0p05_range",
+        noise_tau=0.05,
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "Q_lapnull_reanchor25_b0p5_nt0p05_range",
+        noise_tau=0.05,
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "Q_sqrtlambda_g0p5_nt0p05_range",
+        noise_tau=0.05,
+        gamma_schedule="sqrt_lambda",
+    ))
+    methods.append(cell(
+        "Q_zerofilled_warm0p8_noisegate_residual_0p10_nt0p05_range",
+        warm_init_strategy="zero_filled",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "Q_gfloor0p05_inner_sigma10_drift",
+        gamma_floor=0.05,
+        inner_sigma_max=10.0,
+    ))
+
+    # Block R: penalty schedule / epsilon variants.
+    methods.append(cell(
+        "R_lapnull_pen_constant_mu1p0_matched_drift",
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        penalty_schedule="constant",
+        penalty_scale=1.0,
+    ))
+    methods.append(cell(
+        "R_lapnull_penalty_eps0p01_matched_drift",
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        penalty_eps=0.01,
+    ))
+    methods.append(cell(
+        "R_lap_pen100_matched_nt0p05_range",
+        noise_tau=0.05,
+        precond_mode="laplacian",
+        noise_rhs_mode="matched",
+        penalty_scale=100.0,
+    ))
+
+    return methods
+
+
 def _pdaps_bugcheck_grid(log_level="INFO"):
     """Small post-v8b correctness checks for targeted single-slice reruns."""
     common = dict(
@@ -1896,7 +2201,8 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "pdaps_bugcheck", "warm_sweep"),
+                                 "pdaps_v8a", "pdaps_v8b", "check_abandoned",
+                                 "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")
