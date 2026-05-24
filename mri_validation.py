@@ -118,6 +118,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8a_grid(log_level=log_level)
     if preset == "pdaps_v8b":
         return _pdaps_v8b_grid(log_level=log_level)
+    if preset == "pdaps_bugcheck":
+        return _pdaps_bugcheck_grid(log_level=log_level)
     if preset == "pdaps_targeted":
         return _pdaps_targeted_grid(log_level=log_level)
     pdaps_num_steps_list = [25]   # default unless preset overrides
@@ -273,11 +275,12 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 gamma_schedule="constant", gamma_floor=0.0, gamma_ceiling=float("inf"),
                 precond_mode="standard", noise_rhs_mode="standard",
                 penalty_scale=1.0, penalty_schedule="lambda", penalty_eps=0.0,
-                mask_split_eps=1.0,
+                mask_split_eps=None,
                 mid_inner_project_every=0, tweedie_reanchor_every=0,
                 reanchor_blend_beta=1.0,
                 edm_project_post=False, warm_init_strategy="previous",
                 inner_gate_mode="sigma", residual_threshold=0.3,
+                noise_gate_mode="none", noise_residual_threshold=None,
                 annealing_override=None,
                 tau=1.0,
                 label_suffix=""):
@@ -316,7 +319,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         params["penalty_schedule"] = penalty_schedule
     if penalty_eps > 0.0:
         params["penalty_eps"] = float(penalty_eps)
-    if mask_split_eps != 1.0:
+    if mask_split_eps is not None:
         params["mask_split_eps"] = float(mask_split_eps)
     if mid_inner_project_every > 0:
         params["mid_inner_project_every"] = int(mid_inner_project_every)
@@ -331,6 +334,11 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
     if inner_gate_mode != "sigma":
         params["inner_gate_mode"] = inner_gate_mode
         params["residual_threshold"] = float(residual_threshold)
+    if noise_gate_mode != "none":
+        params["noise_gate_mode"] = noise_gate_mode
+        params["noise_residual_threshold"] = float(
+            residual_threshold if noise_residual_threshold is None else noise_residual_threshold
+        )
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
     lgvd_config = {
         "num_steps": int(lgvd_num_steps),
@@ -347,11 +355,12 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "penalty_scale": float(penalty_scale),
         "penalty_schedule": penalty_schedule,
         "penalty_eps": float(penalty_eps),
-        "mask_split_eps": float(mask_split_eps),
         "mid_inner_project_every": int(mid_inner_project_every),
         "tweedie_reanchor_every": int(tweedie_reanchor_every),
         "reanchor_blend_beta": float(reanchor_blend_beta),
     }
+    if mask_split_eps is not None:
+        lgvd_config["mask_split_eps"] = float(mask_split_eps)
     if gamma_floor > 0.0:
         lgvd_config["gamma_floor"] = float(gamma_floor)
     if math.isfinite(gamma_ceiling):
@@ -383,6 +392,10 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "warm_init_strategy": warm_init_strategy,
             "inner_gate_mode": inner_gate_mode,
             "residual_threshold": float(residual_threshold),
+            "noise_gate_mode": noise_gate_mode,
+            "noise_residual_threshold": (
+                None if noise_residual_threshold is None else float(noise_residual_threshold)
+            ),
             "log_level": log_level,
         },
     }
@@ -1541,6 +1554,49 @@ def _pdaps_v8b_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_bugcheck_grid(log_level="INFO"):
+    """Small post-v8b correctness checks for targeted single-slice reruns."""
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.05,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    return [
+        cell(
+            "bug_E_mask_fixed_nt0p05_range",
+            precond_mode="mask_split",
+            noise_rhs_mode="matched",
+        ),
+        cell(
+            "bug_noisegate_resid0p10_nt0p05_range",
+            noise_gate_mode="residual",
+            noise_residual_threshold=0.10,
+        ),
+    ]
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -1825,7 +1881,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "warm_sweep"),
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list-grid", action="store_true")

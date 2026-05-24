@@ -37,7 +37,7 @@ class MRIInnerPULA:
         penalty_scale=1.0,
         penalty_schedule="lambda",
         penalty_eps=0.0,
-        mask_split_eps=1.0,
+        mask_split_eps=None,
         mid_inner_project_every=0,
         tweedie_reanchor_every=0,
         reanchor_blend_beta=1.0,
@@ -110,8 +110,12 @@ class MRIInnerPULA:
         if self.penalty_schedule not in valid_penalty_schedules:
             raise ValueError(f"Unknown penalty_schedule: {self.penalty_schedule}")
         self.penalty_eps = float(penalty_eps)
-        self.mask_split_eps = float(mask_split_eps)
-        if self.penalty_scale < 0.0 or self.penalty_eps < 0.0 or self.mask_split_eps <= 0.0:
+        self.mask_split_eps = None if mask_split_eps is None else float(mask_split_eps)
+        if (
+            self.penalty_scale < 0.0
+            or self.penalty_eps < 0.0
+            or (self.mask_split_eps is not None and self.mask_split_eps <= 0.0)
+        ):
             raise ValueError("penalty_scale and penalty_eps must be nonnegative; mask_split_eps must be positive")
         self.mid_inner_project_every = int(mid_inner_project_every)
         self.tweedie_reanchor_every = int(tweedie_reanchor_every)
@@ -155,7 +159,18 @@ class MRIInnerPULA:
             return self.penalty_scale
         return self.penalty_scale * lam_raw
 
-    def step(self, pdaps, x, x0hat, y, sigma, ratio, return_stats=False, return_full_stats=False):
+    def step(
+        self,
+        pdaps,
+        x,
+        x0hat,
+        y,
+        sigma,
+        ratio,
+        return_stats=False,
+        return_full_stats=False,
+        noise_scale=1.0,
+    ):
         lams = self.lambdas(sigma)
         lam_raw = lams["raw"]
         lam_target = lams["target"]
@@ -188,7 +203,9 @@ class MRIInnerPULA:
         noise_rhs = torch.zeros_like(x)
         range_rhs = torch.zeros_like(x)
         null_rhs = torch.zeros_like(x)
-        if self.noise_tau > 0.0 and self.noise_mode != "none":
+        noise_scale = float(noise_scale)
+        effective_noise_tau = self.noise_tau * noise_scale
+        if effective_noise_tau > 0.0 and self.noise_mode != "none":
             n1 = math.sqrt(2.0) * torch.randn_like(y)
             n2 = math.sqrt(2.0) * torch.randn(x.shape, dtype=x.dtype, device=x.device)
             ah_n1 = pdaps.AH(n1)
@@ -277,7 +294,7 @@ class MRIInnerPULA:
             cg_noise = 0
 
         step_drift = 0.5 * gamma * drift
-        step_noise = math.sqrt(gamma * self.noise_tau) * noise
+        step_noise = math.sqrt(gamma * effective_noise_tau) * noise
         step_total = step_drift + step_noise
 
         x_next = x + step_total
@@ -293,7 +310,10 @@ class MRIInnerPULA:
                 "lam_solve": lam_solve,
                 "lam_noise": lam_noise,
                 "lam_floored": max(lam_target, lam_solve, lam_noise) > lam_raw + 1e-12,
+                "lam_noise_floored": lam_noise > lam_raw + 1e-12,
                 "noise_tau": self.noise_tau,
+                "effective_noise_tau": effective_noise_tau,
+                "noise_scale": noise_scale,
                 "noise_mode": self.noise_mode,
                 "precond_mode": self.precond_mode,
                 "noise_rhs_mode": self.noise_rhs_mode,
@@ -350,6 +370,7 @@ class MRIInnerPULA:
         trace_log=None,
         target=None,
         trace_records=None,
+        noise_gate_fn=None,
     ):
         """
         trace_log: optional dict with keys {"outer": int, "stride": int, "y": tensor}
@@ -366,19 +387,25 @@ class MRIInnerPULA:
         outer = trace_log.get("outer", -1) if tracing else -1
         for step in range(self.num_steps):
             trace_stats = {}
+            noise_scale = 1.0
+            if noise_gate_fn is not None:
+                noise_scale = 1.0 if noise_gate_fn(x) else 0.0
             log_this = tracing and stride > 0 and (
                 step == 0 or step == self.num_steps - 1 or (step + 1) % stride == 0
             )
             if log_this:
                 x, full_stats = self.step(
-                    pdaps, x, x0hat, y, sigma, ratio, return_full_stats=True
+                    pdaps, x, x0hat, y, sigma, ratio, return_full_stats=True, noise_scale=noise_scale
                 )
                 resid = pdaps.residual_norm(x, y).mean().item()
                 floor_flag = " [λ floored]" if full_stats["lam_floored"] else ""
+                noise_floor_flag = "*" if full_stats["lam_noise_floored"] else ""
                 msg = (
                     f"[P-DAPS]   inner outer={outer:3d} k={step:3d}/{self.num_steps} "
                     f"σ={sigma:.4g} λ={full_stats['lam']:.3e}{floor_flag} γ={full_stats['gamma_eff']:.3e} "
+                    f"λn={full_stats['lam_noise']:.3e}{noise_floor_flag} "
                     f"pre={full_stats['precond_mode']} noise_rhs={full_stats['noise_rhs_mode']} "
+                    f"noise_scale={full_stats['noise_scale']:.1f} "
                     f"α={full_stats['alpha_eff']:.3e} μ={full_stats['penalty_scale']:.3g} "
                     f"pen_sched={full_stats['penalty_schedule']} eps={full_stats['penalty_eps']:.1e} "
                     f"lik.max={full_stats['score_lik_max']:.3e} prior.max={full_stats['score_prior_max']:.3e} "
@@ -405,14 +432,19 @@ class MRIInnerPULA:
                     "step_total_over_sigma": float(full_stats["step_total_over_sigma"]),
                     "step_drift_max": float(full_stats["step_drift_max"]),
                     "step_noise_max": float(full_stats["step_noise_max"]),
+                    "noise_scale": float(full_stats["noise_scale"]),
+                    "lam_noise": float(full_stats["lam_noise"]),
+                    "lam_noise_floored": float(full_stats["lam_noise_floored"]),
                 }
             elif return_stats:
-                x, d_norm, n_norm, cg_iters = self.step(pdaps, x, x0hat, y, sigma, ratio, return_stats=True)
+                x, d_norm, n_norm, cg_iters = self.step(
+                    pdaps, x, x0hat, y, sigma, ratio, return_stats=True, noise_scale=noise_scale
+                )
                 total_drift += d_norm
                 total_noise += n_norm
                 total_cg_iters += cg_iters
             else:
-                x = self.step(pdaps, x, x0hat, y, sigma, ratio)
+                x = self.step(pdaps, x, x0hat, y, sigma, ratio, noise_scale=noise_scale)
             if trace_records is not None:
                 x_range = pdaps.project_range(x)
                 x_null = pdaps.project_null(x)
@@ -434,6 +466,7 @@ class MRIInnerPULA:
                     "null_range_ratio": null_energy / max(range_energy, pdaps.eps),
                     "data_misfit_inner": data_misfit_inner,
                     "x_abs_max": x.abs().max().item(),
+                    "noise_scale": float(noise_scale),
                 }
                 record.update(trace_stats)
                 if target is not None:
@@ -497,6 +530,8 @@ class PDAPS(Algo):
         warm_init_strategy="previous",
         inner_gate_mode="sigma",
         residual_threshold=0.3,
+        noise_gate_mode="none",
+        noise_residual_threshold=None,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -517,6 +552,14 @@ class PDAPS(Algo):
         if self.inner_gate_mode not in {"sigma", "residual", "compound"}:
             raise ValueError(f"Unknown inner_gate_mode: {self.inner_gate_mode}")
         self.residual_threshold = float(residual_threshold)
+        self.noise_gate_mode = str(noise_gate_mode)
+        if self.noise_gate_mode not in {"none", "sigma", "residual", "compound"}:
+            raise ValueError(f"Unknown noise_gate_mode: {self.noise_gate_mode}")
+        self.noise_residual_threshold = (
+            self.residual_threshold
+            if noise_residual_threshold is None
+            else float(noise_residual_threshold)
+        )
         self._warm_init_cache = None
         self._inner_has_run = False
         # edm_project_post: after the inner Langevin produces x_clean, run
@@ -622,7 +665,7 @@ class PDAPS(Algo):
             penalty_op=penalty_op,
         )
 
-    def solve_mask_split(self, rhs, lam, null_rhs=None, mask_split_eps=1.0, return_iters=False):
+    def solve_mask_split(self, rhs, lam, null_rhs=None, mask_split_eps=None, return_iters=False):
         range_rhs = self.project_range(rhs)
         if null_rhs is None:
             null_rhs = self.project_null(rhs)
@@ -643,7 +686,8 @@ class PDAPS(Algo):
         )
         if return_iters:
             range_sol, cg_iters = range_sol
-        null_sol = null_rhs / mask_split_eps
+        null_scale = lam if mask_split_eps is None else float(mask_split_eps)
+        null_sol = null_rhs / null_scale
         sol = self.project_range(range_sol) + null_sol
         if return_iters:
             return sol, cg_iters
@@ -656,7 +700,7 @@ class PDAPS(Algo):
         precond_mode="standard",
         alpha=0.0,
         penalty_eps=0.0,
-        mask_split_eps=1.0,
+        mask_split_eps=None,
         return_iters=False,
     ):
         if precond_mode == "standard":
@@ -753,12 +797,20 @@ class PDAPS(Algo):
             raise ValueError(f"Unknown warm_mode: {self.warm_mode}")
         return alpha * warm_source + (1.0 - alpha) * x0hat
 
-    def inner_gate_active(self, sigma, resid_pre):
-        if self.inner_gate_mode == "sigma":
+    def gate_active(self, mode, sigma, resid, residual_threshold):
+        if mode == "none":
+            return True
+        if mode == "sigma":
             return sigma <= self.inner_sigma_max
-        if self.inner_gate_mode == "residual":
-            return resid_pre <= self.residual_threshold
-        return sigma <= self.inner_sigma_max and resid_pre <= self.residual_threshold
+        if mode == "residual":
+            return resid <= residual_threshold
+        return sigma <= self.inner_sigma_max and resid <= residual_threshold
+
+    def inner_gate_active(self, sigma, resid_pre):
+        return self.gate_active(self.inner_gate_mode, sigma, resid_pre, self.residual_threshold)
+
+    def noise_gate_active(self, sigma, resid):
+        return self.gate_active(self.noise_gate_mode, sigma, resid, self.noise_residual_threshold)
 
     @staticmethod
     def write_trace_npz(trace_path, records):
@@ -808,7 +860,7 @@ class PDAPS(Algo):
         trace_records = [] if trace_path is not None else None
         N = self.annealing.num_steps
         if self.log_level in ["INFO", "DEBUG"]:
-            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}")
+            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}  noise_gate_mode={self.noise_gate_mode}")
         
         disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
         steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
@@ -825,6 +877,19 @@ class PDAPS(Algo):
             resid_pre = self.residual_norm(x0hat, y).mean().item()
 
             inner_active = self.inner_gate_active(float(sigma), resid_pre)
+            noise_gate_outer_active = self.noise_gate_active(float(sigma), resid_pre)
+            self.last_gate_stats.append({
+                "kind": "gate",
+                "outer": int(i),
+                "sigma": float(sigma),
+                "resid_pre": float(resid_pre),
+                "inner_active": bool(inner_active),
+                "inner_gate_mode": self.inner_gate_mode,
+                "residual_threshold": float(self.residual_threshold),
+                "noise_gate_active": bool(noise_gate_outer_active),
+                "noise_gate_mode": self.noise_gate_mode,
+                "noise_residual_threshold": float(self.noise_residual_threshold),
+            })
             if not inner_active:
                 x_clean = x0hat
                 inner_stats = ""
@@ -849,9 +914,10 @@ class PDAPS(Algo):
                         record["ssim_inner"] = ssim_inner
                         record["nmse_inner"] = nmse_inner
                     trace_records.append(record)
-                if self.log_level == "DEBUG" and self.inner_gate_mode == "residual":
+                if self.log_level == "DEBUG":
                     print(
-                        f"[P-DAPS]   inner gate skip outer={i:3d} resid_pre={resid_pre:.3e} "
+                        f"[P-DAPS]   inner gate skip outer={i:3d} mode={self.inner_gate_mode} "
+                        f"σ={sigma:.4f} resid_pre={resid_pre:.3e} "
                         f"threshold={self.residual_threshold:.3e}",
                         flush=True,
                     )
@@ -866,18 +932,32 @@ class PDAPS(Algo):
                         )
                 x_init = self.init_inner(warm_prev, x0hat, y)
                 if self.log_level == "DEBUG":
+                    def noise_gate_fn(x_cur):
+                        if self.noise_gate_mode == "none":
+                            return True
+                        resid_cur = self.residual_norm(x_cur, y).mean().item()
+                        return self.noise_gate_active(float(sigma), resid_cur)
+
                     trace_log = {"outer": i, "stride": inner_log_stride, "y": y} if inner_log_stride > 0 else None
                     x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
                         self, x_init, x0hat, y, sigma, i / max(1, N),
                         return_stats=True, trace_log=trace_log,
                         target=target_complex, trace_records=trace_records,
+                        noise_gate_fn=noise_gate_fn,
                     )
                     inner_dist = (x_clean - x0hat).abs().mean().item()
                     inner_stats = f" inner_dist={inner_dist:.3e} CG={avg_cg:.1f} drift={avg_drift:.3e} noise={avg_noise:.3e}"
                 else:
+                    def noise_gate_fn(x_cur):
+                        if self.noise_gate_mode == "none":
+                            return True
+                        resid_cur = self.residual_norm(x_cur, y).mean().item()
+                        return self.noise_gate_active(float(sigma), resid_cur)
+
                     x_clean = self.inner.sample(
                         self, x_init, x0hat, y, sigma, i / max(1, N),
                         target=target_complex, trace_records=trace_records,
+                        noise_gate_fn=noise_gate_fn,
                     )
                     inner_stats = ""
                 self._inner_has_run = True
