@@ -281,6 +281,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 edm_project_post=False, warm_init_strategy="previous",
                 inner_gate_mode="sigma", residual_threshold=0.3,
                 noise_gate_mode="none", noise_residual_threshold=None,
+                noise_sigma_min=None, noise_residual_min=None,
                 annealing_override=None,
                 tau=1.0,
                 label_suffix=""):
@@ -336,9 +337,14 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         params["residual_threshold"] = float(residual_threshold)
     if noise_gate_mode != "none":
         params["noise_gate_mode"] = noise_gate_mode
-        params["noise_residual_threshold"] = float(
-            residual_threshold if noise_residual_threshold is None else noise_residual_threshold
-        )
+        if noise_gate_mode in {"residual", "compound"}:
+            params["noise_residual_threshold"] = float(
+                residual_threshold if noise_residual_threshold is None else noise_residual_threshold
+            )
+        if noise_gate_mode in {"sigma_early", "compound_early"}:
+            params["noise_sigma_min"] = None if noise_sigma_min is None else float(noise_sigma_min)
+        if noise_gate_mode in {"residual_early", "compound_early"}:
+            params["noise_residual_min"] = None if noise_residual_min is None else float(noise_residual_min)
     method_label = method + (f"[{label_suffix}]" if label_suffix else "")
     lgvd_config = {
         "num_steps": int(lgvd_num_steps),
@@ -396,6 +402,8 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "noise_residual_threshold": (
                 None if noise_residual_threshold is None else float(noise_residual_threshold)
             ),
+            "noise_sigma_min": None if noise_sigma_min is None else float(noise_sigma_min),
+            "noise_residual_min": None if noise_residual_min is None else float(noise_residual_min),
             "log_level": log_level,
         },
     }
@@ -1593,6 +1601,13 @@ def _pdaps_bugcheck_grid(log_level="INFO"):
             "bug_noisegate_resid0p10_nt0p05_range",
             noise_gate_mode="residual",
             noise_residual_threshold=0.10,
+        ),
+        cell(
+            "bug_full_nt0p005_sigmaearly1p0",
+            noise_tau=0.005,
+            noise_mode="full",
+            noise_gate_mode="sigma_early",
+            noise_sigma_min=1.0,
         ),
     ]
 

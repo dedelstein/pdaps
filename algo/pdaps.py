@@ -388,8 +388,14 @@ class MRIInnerPULA:
         for step in range(self.num_steps):
             trace_stats = {}
             noise_scale = 1.0
+            noise_gate_resid = np.nan
             if noise_gate_fn is not None:
-                noise_scale = 1.0 if noise_gate_fn(x) else 0.0
+                gate_result = noise_gate_fn(x)
+                if isinstance(gate_result, tuple):
+                    gate_active, noise_gate_resid = gate_result
+                else:
+                    gate_active = gate_result
+                noise_scale = 1.0 if gate_active else 0.0
             log_this = tracing and stride > 0 and (
                 step == 0 or step == self.num_steps - 1 or (step + 1) % stride == 0
             )
@@ -433,6 +439,7 @@ class MRIInnerPULA:
                     "step_drift_max": float(full_stats["step_drift_max"]),
                     "step_noise_max": float(full_stats["step_noise_max"]),
                     "noise_scale": float(full_stats["noise_scale"]),
+                    "noise_gate_resid": float(noise_gate_resid),
                     "lam_noise": float(full_stats["lam_noise"]),
                     "lam_noise_floored": float(full_stats["lam_noise_floored"]),
                 }
@@ -467,6 +474,7 @@ class MRIInnerPULA:
                     "data_misfit_inner": data_misfit_inner,
                     "x_abs_max": x.abs().max().item(),
                     "noise_scale": float(noise_scale),
+                    "noise_gate_resid": float(noise_gate_resid),
                 }
                 record.update(trace_stats)
                 if target is not None:
@@ -532,6 +540,8 @@ class PDAPS(Algo):
         residual_threshold=0.3,
         noise_gate_mode="none",
         noise_residual_threshold=None,
+        noise_sigma_min=None,
+        noise_residual_min=None,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -553,13 +563,31 @@ class PDAPS(Algo):
             raise ValueError(f"Unknown inner_gate_mode: {self.inner_gate_mode}")
         self.residual_threshold = float(residual_threshold)
         self.noise_gate_mode = str(noise_gate_mode)
-        if self.noise_gate_mode not in {"none", "sigma", "residual", "compound"}:
+        valid_noise_gate_modes = {
+            "none",
+            "sigma",
+            "residual",
+            "compound",
+            "sigma_early",
+            "residual_early",
+            "compound_early",
+        }
+        if self.noise_gate_mode not in valid_noise_gate_modes:
             raise ValueError(f"Unknown noise_gate_mode: {self.noise_gate_mode}")
-        self.noise_residual_threshold = (
-            self.residual_threshold
-            if noise_residual_threshold is None
-            else float(noise_residual_threshold)
-        )
+        if noise_residual_threshold is None:
+            self.noise_residual_threshold = (
+                self.residual_threshold
+                if self.noise_gate_mode in {"residual", "compound"}
+                else None
+            )
+        else:
+            self.noise_residual_threshold = float(noise_residual_threshold)
+        self.noise_sigma_min = None if noise_sigma_min is None else float(noise_sigma_min)
+        self.noise_residual_min = None if noise_residual_min is None else float(noise_residual_min)
+        if self.noise_gate_mode in {"sigma_early", "compound_early"} and self.noise_sigma_min is None:
+            raise ValueError(f"noise_sigma_min is required for noise_gate_mode='{self.noise_gate_mode}'")
+        if self.noise_gate_mode in {"residual_early", "compound_early"} and self.noise_residual_min is None:
+            raise ValueError(f"noise_residual_min is required for noise_gate_mode='{self.noise_gate_mode}'")
         self._warm_init_cache = None
         self._inner_has_run = False
         # edm_project_post: after the inner Langevin produces x_clean, run
@@ -797,9 +825,7 @@ class PDAPS(Algo):
             raise ValueError(f"Unknown warm_mode: {self.warm_mode}")
         return alpha * warm_source + (1.0 - alpha) * x0hat
 
-    def gate_active(self, mode, sigma, resid, residual_threshold):
-        if mode == "none":
-            return True
+    def late_gate_active(self, mode, sigma, resid, residual_threshold):
         if mode == "sigma":
             return sigma <= self.inner_sigma_max
         if mode == "residual":
@@ -807,10 +833,23 @@ class PDAPS(Algo):
         return sigma <= self.inner_sigma_max and resid <= residual_threshold
 
     def inner_gate_active(self, sigma, resid_pre):
-        return self.gate_active(self.inner_gate_mode, sigma, resid_pre, self.residual_threshold)
+        return self.late_gate_active(self.inner_gate_mode, sigma, resid_pre, self.residual_threshold)
 
     def noise_gate_active(self, sigma, resid):
-        return self.gate_active(self.noise_gate_mode, sigma, resid, self.noise_residual_threshold)
+        if self.noise_gate_mode == "none":
+            return True
+        if self.noise_gate_mode in {"sigma", "residual", "compound"}:
+            return self.late_gate_active(
+                self.noise_gate_mode,
+                sigma,
+                resid,
+                self.noise_residual_threshold,
+            )
+        if self.noise_gate_mode == "sigma_early":
+            return sigma >= self.noise_sigma_min
+        if self.noise_gate_mode == "residual_early":
+            return resid >= self.noise_residual_min
+        return sigma >= self.noise_sigma_min and resid >= self.noise_residual_min
 
     @staticmethod
     def write_trace_npz(trace_path, records):
@@ -860,7 +899,7 @@ class PDAPS(Algo):
         trace_records = [] if trace_path is not None else None
         N = self.annealing.num_steps
         if self.log_level in ["INFO", "DEBUG"]:
-            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}  noise_gate_mode={self.noise_gate_mode}")
+            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}  noise_gate_mode={self.noise_gate_mode}  noise_sigma_min={self.noise_sigma_min}  noise_residual_min={self.noise_residual_min}")
         
         disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
         steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
@@ -888,7 +927,9 @@ class PDAPS(Algo):
                 "residual_threshold": float(self.residual_threshold),
                 "noise_gate_active": bool(noise_gate_outer_active),
                 "noise_gate_mode": self.noise_gate_mode,
-                "noise_residual_threshold": float(self.noise_residual_threshold),
+                "noise_residual_threshold": self.noise_residual_threshold,
+                "noise_sigma_min": self.noise_sigma_min,
+                "noise_residual_min": self.noise_residual_min,
             })
             if not inner_active:
                 x_clean = x0hat
@@ -934,9 +975,9 @@ class PDAPS(Algo):
                 if self.log_level == "DEBUG":
                     def noise_gate_fn(x_cur):
                         if self.noise_gate_mode == "none":
-                            return True
+                            return True, np.nan
                         resid_cur = self.residual_norm(x_cur, y).mean().item()
-                        return self.noise_gate_active(float(sigma), resid_cur)
+                        return self.noise_gate_active(float(sigma), resid_cur), resid_cur
 
                     trace_log = {"outer": i, "stride": inner_log_stride, "y": y} if inner_log_stride > 0 else None
                     x_clean, avg_cg, avg_drift, avg_noise = self.inner.sample(
@@ -950,9 +991,9 @@ class PDAPS(Algo):
                 else:
                     def noise_gate_fn(x_cur):
                         if self.noise_gate_mode == "none":
-                            return True
+                            return True, np.nan
                         resid_cur = self.residual_norm(x_cur, y).mean().item()
-                        return self.noise_gate_active(float(sigma), resid_cur)
+                        return self.noise_gate_active(float(sigma), resid_cur), resid_cur
 
                     x_clean = self.inner.sample(
                         self, x_init, x0hat, y, sigma, i / max(1, N),
