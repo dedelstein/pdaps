@@ -118,6 +118,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8a_grid(log_level=log_level)
     if preset == "pdaps_v8b":
         return _pdaps_v8b_grid(log_level=log_level)
+    if preset == "pdaps_v8c":
+        return _pdaps_v8c_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -1564,6 +1566,177 @@ def _pdaps_v8b_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8c_grid(log_level="INFO"):
+    """
+    v8c P-DAPS rescue-surface grid.
+
+    Pinned to the v8a operating point, this preset maps early-gated full/null
+    noise rescue while carrying forward the v8b lower-but-live controls under
+    the fixed mask_split and gate-diagnostic code.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    # Block A: rescue surface for previously catastrophic full/null noise.
+    full_tau_labels = (
+        (0.0005, "0p0005"),
+        (0.001, "0p001"),
+        (0.0025, "0p0025"),
+        (0.005, "0p005"),
+        (0.01, "0p01"),
+    )
+    sigma_min_labels = (
+        (0.5, "0p5"),
+        (1.0, "1p0"),
+        (2.0, "2p0"),
+        (3.0, "3p0"),
+    )
+    for noise_tau, tau_label in full_tau_labels:
+        for noise_sigma_min, sigma_label in sigma_min_labels:
+            methods.append(cell(
+                f"v8c_A_full_nt{tau_label}_smin{sigma_label}",
+                noise_tau=noise_tau,
+                noise_mode="full",
+                noise_gate_mode="sigma_early",
+                noise_sigma_min=noise_sigma_min,
+            ))
+
+    for noise_tau, tau_label in ((0.001, "0p001"), (0.005, "0p005")):
+        for noise_sigma_min, sigma_label in sigma_min_labels[:3]:
+            methods.append(cell(
+                f"v8c_A_null_nt{tau_label}_smin{sigma_label}",
+                noise_tau=noise_tau,
+                noise_mode="null_only",
+                noise_gate_mode="sigma_early",
+                noise_sigma_min=noise_sigma_min,
+            ))
+
+    # Block B: range-only tau extension under the safe noise family.
+    for noise_tau, tau_label in (
+        (0.005, "0p005"),
+        (0.025, "0p025"),
+        (0.05, "0p05"),
+        (0.10, "0p10"),
+    ):
+        methods.append(cell(
+            f"v8c_B_range_nt{tau_label}",
+            noise_tau=noise_tau,
+            noise_mode="range_only",
+        ))
+
+    # Block C: high-beta reanchor checks on range-only noise.
+    for beta, beta_label in ((0.50, "0p5"), (1.00, "1p0")):
+        methods.append(cell(
+            f"v8c_C_reanchor25_b{beta_label}_nt0p05_range",
+            noise_tau=0.05,
+            noise_mode="range_only",
+            tweedie_reanchor_every=25,
+            reanchor_blend_beta=beta,
+        ))
+
+    # Block D: lower-but-live knobs and fixed-bug controls.
+    methods.append(cell(
+        "v8c_D_lapnull_nt0p05_range",
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_mode="range_only",
+    ))
+    methods.append(cell(
+        "v8c_D_adaptive_warm_nt0p05_range",
+        warm_mode="adaptive",
+        noise_tau=0.05,
+        noise_mode="range_only",
+    ))
+    methods.append(cell(
+        "v8c_D_mask_split_nt0p05_range",
+        precond_mode="mask_split",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_mode="range_only",
+    ))
+    methods.append(cell(
+        "v8c_D_late_resid0p10_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "v8c_D_lapnull_late_resid0p10_nt0p05_range",
+        precond_mode="laplacian_null",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "v8c_D_lnf0p1_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        noise_lam_floor=0.1,
+    ))
+    methods.append(cell(
+        "v8c_D_lnf1p0_nt0p05_range",
+        noise_tau=0.05,
+        noise_mode="range_only",
+        noise_lam_floor=1.0,
+    ))
+
+    # Block E: residual-based early gates.
+    methods.append(cell(
+        "v8c_E_full_nt0p005_residearly_rmin0p20",
+        noise_tau=0.005,
+        noise_mode="full",
+        noise_gate_mode="residual_early",
+        noise_residual_min=0.20,
+    ))
+    methods.append(cell(
+        "v8c_E_full_nt0p005_compoundearly_smin1p0_rmin0p20",
+        noise_tau=0.005,
+        noise_mode="full",
+        noise_gate_mode="compound_early",
+        noise_sigma_min=1.0,
+        noise_residual_min=0.20,
+    ))
+    methods.append(cell(
+        "v8c_E_null_nt0p005_residearly_rmin0p20",
+        noise_tau=0.005,
+        noise_mode="null_only",
+        noise_gate_mode="residual_early",
+        noise_residual_min=0.20,
+    ))
+
+    return methods
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -2201,7 +2374,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "check_abandoned",
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
