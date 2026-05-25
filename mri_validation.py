@@ -120,6 +120,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8b_grid(log_level=log_level)
     if preset == "pdaps_v8c":
         return _pdaps_v8c_grid(log_level=log_level)
+    if preset == "pdaps_v8d":
+        return _pdaps_v8d_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -1737,6 +1739,203 @@ def _pdaps_v8c_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8d_grid(log_level="INFO"):
+    """
+    v8d P-DAPS single-slice surface map.
+
+    Covers early-termination, range/residual/sigma-early noise surfaces,
+    warm-init x LGVD budget, live gamma/reanchor corners, and distinct
+    mask_split rescue attempts. Pinned to the v8a/v8c operating point.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    # Anchors: keep the v8a/v8c operating points visible in this run.
+    methods.append(cell("v8d_anchor_outer200_range_nt0p05", noise_tau=0.05))
+    methods.append(cell("v8d_anchor_outer200_drift"))
+    methods.append(cell(
+        "v8d_anchor_outer150_range_nt0p05",
+        annealing_override={"num_steps": 150},
+        noise_tau=0.05,
+    ))
+    methods.append(cell(
+        "v8d_anchor_outer150_drift",
+        annealing_override={"num_steps": 150},
+    ))
+
+    # Block A: early-termination cliff. Outer-150 points are the anchors above.
+    for outer, outer_label in ((175, "175"), (125, "125"), (100, "100"), (75, "75")):
+        methods.append(cell(
+            f"v8d_A_outer{outer_label}_range_nt0p05",
+            annealing_override={"num_steps": outer},
+            noise_tau=0.05,
+        ))
+    for outer, outer_label in ((125, "125"), (100, "100")):
+        methods.append(cell(
+            f"v8d_A_outer{outer_label}_drift",
+            annealing_override={"num_steps": outer},
+        ))
+
+    # Block B: range-only tau sweep at the outer-150 budget.
+    for noise_tau, tau_label in ((0.005, "0p005"), (0.025, "0p025"), (0.10, "0p10")):
+        methods.append(cell(
+            f"v8d_B_outer150_range_nt{tau_label}",
+            annealing_override={"num_steps": 150},
+            noise_tau=noise_tau,
+        ))
+
+    # Block C: residual-gated range noise.
+    for noise_tau, tau_label, threshold, thresh_label in (
+        (0.05, "0p05", 0.05, "0p05"),
+        (0.05, "0p05", 0.10, "0p10"),
+        (0.05, "0p05", 0.20, "0p20"),
+        (0.10, "0p10", 0.10, "0p10"),
+        (0.10, "0p10", 0.20, "0p20"),
+    ):
+        methods.append(cell(
+            f"v8d_C_resid{thresh_label}_nt{tau_label}_range",
+            noise_tau=noise_tau,
+            noise_gate_mode="residual",
+            noise_residual_threshold=threshold,
+        ))
+
+    # Block D: compact sigma_early rescue surface.
+    for noise_tau, tau_label, noise_sigma_min, sigma_label in (
+        (0.0005, "0p0005", 0.5, "0p5"),
+        (0.001, "0p001", 0.5, "0p5"),
+        (0.0025, "0p0025", 0.5, "0p5"),
+        (0.001, "0p001", 1.0, "1p0"),
+    ):
+        methods.append(cell(
+            f"v8d_D_full_nt{tau_label}_smin{sigma_label}",
+            noise_tau=noise_tau,
+            noise_mode="full",
+            noise_gate_mode="sigma_early",
+            noise_sigma_min=noise_sigma_min,
+        ))
+    for noise_tau, tau_label, noise_sigma_min, sigma_label in (
+        (0.001, "0p001", 0.5, "0p5"),
+        (0.005, "0p005", 0.5, "0p5"),
+        (0.001, "0p001", 1.0, "1p0"),
+    ):
+        methods.append(cell(
+            f"v8d_D_null_nt{tau_label}_smin{sigma_label}",
+            noise_tau=noise_tau,
+            noise_mode="null_only",
+            noise_gate_mode="sigma_early",
+            noise_sigma_min=noise_sigma_min,
+        ))
+
+    # Block E: warm init x LGVD budget, drift only.
+    for lgvd_num_steps in (100, 50, 25):
+        for init_label, warm_init_strategy in (("cgsense", "cgsense"), ("zerofilled", "zero_filled")):
+            methods.append(cell(
+                f"v8d_E_lgvd{lgvd_num_steps}_{init_label}_drift",
+                lgvd_num_steps=lgvd_num_steps,
+                warm_init_strategy=warm_init_strategy,
+            ))
+
+    # Block F: gamma x warm live corners. warm_fraction=0.8 is inherited.
+    methods.append(cell("v8d_F_g0p75_warm0p8_drift", gamma=0.75))
+    methods.append(cell("v8d_F_g0p75_warm0p8_nt0p05_range", gamma=0.75, noise_tau=0.05))
+    methods.append(cell("v8d_F_g0p75_warm0p8_nt0p10_range", gamma=0.75, noise_tau=0.10))
+    methods.append(cell("v8d_F_g1p0_warm0p8_drift", gamma=1.0))
+    methods.append(cell("v8d_F_g1p0_warm0p8_nt0p05_range", gamma=1.0, noise_tau=0.05))
+
+    # Block G: reanchor alive-axis probes outside the range nt=0.05 factorial.
+    methods.append(cell(
+        "v8d_G_reanchor10_b0p5_drift",
+        tweedie_reanchor_every=10,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "v8d_G_reanchor50_b0p5_drift",
+        tweedie_reanchor_every=50,
+        reanchor_blend_beta=0.5,
+    ))
+    methods.append(cell(
+        "v8d_G_reanchor25_b0p5_nt0p10_range",
+        tweedie_reanchor_every=25,
+        reanchor_blend_beta=0.5,
+        noise_tau=0.10,
+    ))
+
+    # Block H: mask_split rescue attempts available without a step cap.
+    methods.append(cell(
+        "v8d_H_mask_split_drift",
+        precond_mode="mask_split",
+        noise_rhs_mode="matched",
+    ))
+    methods.append(cell(
+        "v8d_H_mask_split_nt0p05_range_resid0p10",
+        precond_mode="mask_split",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.10,
+    ))
+    methods.append(cell(
+        "v8d_H_mask_split_nt0p05_range_resid0p20",
+        precond_mode="mask_split",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_gate_mode="residual",
+        noise_residual_threshold=0.20,
+    ))
+    methods.append(cell(
+        "v8d_H_mask_split_nt0p05_range_sigmaearly_smin1p0",
+        precond_mode="mask_split",
+        noise_rhs_mode="matched",
+        noise_tau=0.05,
+        noise_gate_mode="sigma_early",
+        noise_sigma_min=1.0,
+    ))
+
+    # Block I: reanchor cadence x effective time-constant surface.
+    for label_suffix, every, beta in (
+        ("v8d_I_sanity_K25_b0p5_nt0p05_range", 25, 0.5),
+        ("v8d_I_tau100_K5_b0p05_nt0p05_range", 5, 0.05),
+        ("v8d_I_tau100_K10_b0p1_nt0p05_range", 10, 0.1),
+        ("v8d_I_tau100_K25_b0p25_nt0p05_range", 25, 0.25),
+        ("v8d_I_tau50_K10_b0p2_nt0p05_range", 10, 0.2),
+        ("v8d_I_tau25_K5_b0p2_nt0p05_range", 5, 0.2),
+    ):
+        methods.append(cell(
+            label_suffix,
+            noise_tau=0.05,
+            tweedie_reanchor_every=every,
+            reanchor_blend_beta=beta,
+        ))
+
+    return methods
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -2374,7 +2573,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "check_abandoned",
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
