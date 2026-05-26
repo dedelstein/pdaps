@@ -47,6 +47,9 @@ ANNEALING = {
 }
 
 DAPS_TAU = 0.002028752174814177
+WARN_DMO_RATIO = 1.5
+WARN_DMO_NORMAL = 0.035
+WARN_SSIM_FLOOR = 0.40
 
 REVERSE_ODE = {
     "num_steps": 5,
@@ -122,6 +125,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8c_grid(log_level=log_level)
     if preset == "pdaps_v8d":
         return _pdaps_v8d_grid(log_level=log_level)
+    if preset == "pdaps_v8e":
+        return _pdaps_v8e_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -289,6 +294,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 noise_gate_mode="none", noise_residual_threshold=None,
                 noise_sigma_min=None, noise_residual_min=None,
                 annealing_override=None,
+                sigma_stop_truncate=None,
                 tau=1.0,
                 label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
@@ -388,6 +394,8 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         annealing_scheduler_config = {**ANNEALING, **annealing_override}
         for key, value in annealing_override.items():
             params[f"annealing_{key}"] = value
+    if sigma_stop_truncate is not None:
+        params["sigma_stop_truncate"] = float(sigma_stop_truncate)
 
     return {
         "method": method_label,
@@ -410,6 +418,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             ),
             "noise_sigma_min": None if noise_sigma_min is None else float(noise_sigma_min),
             "noise_residual_min": None if noise_residual_min is None else float(noise_residual_min),
+            "sigma_stop_truncate": None if sigma_stop_truncate is None else float(sigma_stop_truncate),
             "log_level": log_level,
         },
     }
@@ -1936,6 +1945,80 @@ def _pdaps_v8d_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8e_grid(log_level="INFO"):
+    """
+    v8e terminal-sigma ablation.
+
+    Clean cells use sigma_stop_truncate to slice the reference v8d
+    200-step schedule. Lite cells use annealing sigma_min overrides to test
+    denser re-spacing over the kept sigma range.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    clean_cells = (
+        ("v8e_clean_lgvd100_stop0p10", 100, 0.10),
+        ("v8e_clean_lgvd100_stop0p115", 100, 0.115),
+        ("v8e_clean_lgvd100_stop0p14", 100, 0.14),
+        ("v8e_clean_lgvd100_stop0p17", 100, 0.17),
+        ("v8e_clean_lgvd100_stop0p25", 100, 0.25),
+        ("v8e_clean_lgvd50_stop0p10", 50, 0.10),
+        ("v8e_clean_lgvd50_stop0p115", 50, 0.115),
+        ("v8e_clean_lgvd50_stop0p14", 50, 0.14),
+        ("v8e_clean_lgvd50_stop0p17", 50, 0.17),
+        ("v8e_clean_lgvd50_stop0p25", 50, 0.25),
+        ("v8e_clean_lgvd25_stop0p38", 25, 0.38),
+    )
+    for label_suffix, lgvd_num_steps, sigma_stop in clean_cells:
+        methods.append(cell(
+            label_suffix,
+            lgvd_num_steps=lgvd_num_steps,
+            sigma_stop_truncate=sigma_stop,
+        ))
+
+    lite_cells = (
+        ("v8e_lite_lgvd100_smin0p14", 100, 0.14),
+        ("v8e_lite_lgvd100_smin0p17", 100, 0.17),
+        ("v8e_lite_lgvd50_smin0p17", 50, 0.17),
+        ("v8e_lite_lgvd50_smin0p25", 50, 0.25),
+        ("v8e_lite_lgvd25_smin0p38", 25, 0.38),
+    )
+    for label_suffix, lgvd_num_steps, sigma_min in lite_cells:
+        methods.append(cell(
+            label_suffix,
+            lgvd_num_steps=lgvd_num_steps,
+            annealing_override={"sigma_min": sigma_min},
+        ))
+
+    return methods
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -2372,6 +2455,10 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                 if not metrics.get("finite", False) or not all(math.isfinite(float(metrics[name])) for name in metric_names):
                     row["failed"] = True
                     row["error"] = "nonfinite_reconstruction_or_metrics"
+                row["catastrophe_warn"] = bool(
+                    metrics.get("ssim", 1.0) < WARN_SSIM_FLOOR
+                    or metrics.get("data_misfit_per_observed", 0.0) > WARN_DMO_RATIO * WARN_DMO_NORMAL
+                )
                 row["runtime_s"] = time.perf_counter() - start
                 row["gate_stats_json"] = json.dumps(getattr(algo, "last_gate_stats", []))
 
@@ -2399,6 +2486,7 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                         os.chdir(old_cwd)
             except Exception as exc:
                 row["failed"] = True
+                row["catastrophe_warn"] = False
                 row["error"] = repr(exc)
                 row["runtime_s"] = time.perf_counter() - start
 
@@ -2434,6 +2522,10 @@ def summarize(rows):
             "n": len(group),
             "n_ok": len(ok),
             "failure_rate": 1.0 - len(ok) / max(1, len(group)),
+            "catastrophe_warn_rate": (
+                sum(1 for row in group if str(row.get("catastrophe_warn", False)).lower() == "true")
+                / max(1, len(group))
+            ),
         }
         for metric in ("psnr", "ssim", "nmse", "data_misfit", "data_misfit_per_observed", "runtime_s"):
             vals = [float(row[metric]) for row in ok if metric in row]
@@ -2467,7 +2559,10 @@ def write_ablation_artifacts(out_dir, val_rows, test_rows):
     expanded = expand_params_rows(combined)
     write_csv(out_dir / "ablation_table.csv", expanded)
 
-    failures = [row for row in expanded if row.get("failed")]
+    failures = [
+        row for row in expanded
+        if row.get("failed") or str(row.get("catastrophe_warn", False)).lower() == "true"
+    ]
     if failures:
         write_csv(out_dir / "failure_table.csv", failures)
     else:
@@ -2573,7 +2668,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "check_abandoned",
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "pdaps_v8e", "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")

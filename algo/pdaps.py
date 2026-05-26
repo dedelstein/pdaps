@@ -542,6 +542,7 @@ class PDAPS(Algo):
         noise_residual_threshold=None,
         noise_sigma_min=None,
         noise_residual_min=None,
+        sigma_stop_truncate=None,
     ):
         super().__init__(net, forward_op)
         self.net = net.eval().requires_grad_(False)
@@ -584,6 +585,7 @@ class PDAPS(Algo):
             self.noise_residual_threshold = float(noise_residual_threshold)
         self.noise_sigma_min = None if noise_sigma_min is None else float(noise_sigma_min)
         self.noise_residual_min = None if noise_residual_min is None else float(noise_residual_min)
+        self.sigma_stop_truncate = None if sigma_stop_truncate is None else float(sigma_stop_truncate)
         if self.noise_gate_mode in {"sigma_early", "compound_early"} and self.noise_sigma_min is None:
             raise ValueError(f"noise_sigma_min is required for noise_gate_mode='{self.noise_gate_mode}'")
         if self.noise_gate_mode in {"residual_early", "compound_early"} and self.noise_residual_min is None:
@@ -899,7 +901,7 @@ class PDAPS(Algo):
         trace_records = [] if trace_path is not None else None
         N = self.annealing.num_steps
         if self.log_level in ["INFO", "DEBUG"]:
-            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}  noise_gate_mode={self.noise_gate_mode}  noise_sigma_min={self.noise_sigma_min}  noise_residual_min={self.noise_residual_min}")
+            print(f"[P-DAPS] init: xt.abs.max={xt.abs().max().item():.3e}  y.abs.max={y.abs().max().item():.3e}  warm_mode={self.warm_mode}  warm_fraction={self.warm_fraction}  inner_sigma_max={self.inner_sigma_max}  warm_init_strategy={self.warm_init_strategy}  inner_gate_mode={self.inner_gate_mode}  noise_gate_mode={self.noise_gate_mode}  noise_sigma_min={self.noise_sigma_min}  noise_residual_min={self.noise_residual_min}  sigma_stop_truncate={self.sigma_stop_truncate}")
         
         disable_tqdm = (self.log_level in ["VAL", "WARN"] or not verbose)
         steps = tqdm.trange(N, desc="P-DAPS", disable=disable_tqdm)
@@ -909,6 +911,14 @@ class PDAPS(Algo):
 
         for i in steps:
             sigma = self.annealing.sigma_steps[i]
+            if self.sigma_stop_truncate is not None and float(sigma) < self.sigma_stop_truncate:
+                if self.log_level in ["INFO", "DEBUG"]:
+                    print(
+                        f"[P-DAPS] sigma_stop_truncate={self.sigma_stop_truncate:g} "
+                        f"reached at outer={i} sigma={float(sigma):g}; breaking outer loop",
+                        flush=True,
+                    )
+                break
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
 
