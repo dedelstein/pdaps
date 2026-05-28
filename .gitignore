@@ -10,6 +10,8 @@ wheels/
 .venv
 
 *.sh
+!submit_pdaps_v8c_accel4.sh
+!submit_pdaps_v8c_accel8.sh
 
 .env
 

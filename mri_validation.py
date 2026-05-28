@@ -127,6 +127,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8d_grid(log_level=log_level)
     if preset == "pdaps_v8e":
         return _pdaps_v8e_grid(log_level=log_level)
+    if preset == "pdaps_v8f":
+        return _pdaps_v8f_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -2019,6 +2021,65 @@ def _pdaps_v8e_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_v8f_grid(log_level="INFO"):
+    """
+    v8f post-fix terminal-sigma ablation.
+
+    Re-runs only the clean sigma_stop_truncate cells invalidated by the v8e
+    return-value bug. Lite cells are intentionally omitted; v8e lite rows did
+    not hit the truncation branch and remain valid comparison anchors.
+    """
+    methods = []
+
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=100,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+    )
+
+    def cell(label_suffix, **overrides):
+        cfg = dict(common)
+        cfg.update(overrides)
+        entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+        entry["params"]["noise_mode"] = cfg["noise_mode"]
+        return entry
+
+    clean_cells = (
+        ("v8f_clean_lgvd100_stop0p10", 100, 0.10),
+        ("v8f_clean_lgvd100_stop0p115", 100, 0.115),
+        ("v8f_clean_lgvd100_stop0p14", 100, 0.14),
+        ("v8f_clean_lgvd100_stop0p17", 100, 0.17),
+        ("v8f_clean_lgvd100_stop0p25", 100, 0.25),
+        ("v8f_clean_lgvd50_stop0p10", 50, 0.10),
+        ("v8f_clean_lgvd50_stop0p14", 50, 0.14),
+        ("v8f_clean_lgvd50_stop0p17", 50, 0.17),
+        ("v8f_clean_lgvd50_stop0p25", 50, 0.25),
+        ("v8f_clean_lgvd25_stop0p38", 25, 0.38),
+    )
+    for label_suffix, lgvd_num_steps, sigma_stop in clean_cells:
+        methods.append(cell(
+            label_suffix,
+            lgvd_num_steps=lgvd_num_steps,
+            sigma_stop_truncate=sigma_stop,
+        ))
+
+    return methods
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -2668,7 +2729,7 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "pdaps_v8e", "check_abandoned",
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "pdaps_v8e", "pdaps_v8f", "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")

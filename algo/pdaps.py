@@ -918,6 +918,8 @@ class PDAPS(Algo):
                         f"reached at outer={i} sigma={float(sigma):g}; breaking outer loop",
                         flush=True,
                     )
+                if x_prev is not None:
+                    xt = self.to_real(x_prev)
                 break
             ode = DiffusionSampler(Scheduler(**self.diffusion_config, sigma_max=sigma))
             x0hat = self.to_complex(ode.sample(self.net, xt, SDE=False, verbose=False))
