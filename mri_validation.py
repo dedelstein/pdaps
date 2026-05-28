@@ -129,6 +129,30 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_v8e_grid(log_level=log_level)
     if preset == "pdaps_v8f":
         return _pdaps_v8f_grid(log_level=log_level)
+    if preset == "pdaps_working":
+        return _pdaps_working_grid(log_level=log_level)
+    if preset == "pdaps_prelaunch_c0":
+        return _pdaps_prelaunch_c0_grid(log_level=log_level)
+    if preset == "pdaps_prelaunch_a_v8f":
+        return _pdaps_prelaunch_a_grid(base="v8f", log_level=log_level)
+    if preset == "pdaps_prelaunch_a_floor0":
+        return _pdaps_prelaunch_a_grid(base="floor0", log_level=log_level)
+    if preset == "pdaps_prelaunch_a_inf":
+        return _pdaps_prelaunch_a_grid(base="inf", log_level=log_level)
+    if preset == "pdaps_prelaunch_a_floor0_inf":
+        return _pdaps_prelaunch_a_grid(base="floor0_inf", log_level=log_level)
+    if preset == "pdaps_prelaunch_b_v8f_balfast":
+        return _pdaps_prelaunch_b_grid(base="v8f", anchors="balfast", log_level=log_level)
+    if preset == "pdaps_prelaunch_b_v8f_balanced":
+        return _pdaps_prelaunch_b_grid(base="v8f", anchors="balanced", log_level=log_level)
+    if preset == "pdaps_prelaunch_b_floor0_balfast":
+        return _pdaps_prelaunch_b_grid(base="floor0", anchors="balfast", log_level=log_level)
+    if preset == "pdaps_prelaunch_b_inf_balfast":
+        return _pdaps_prelaunch_b_grid(base="inf", anchors="balfast", log_level=log_level)
+    if preset == "pdaps_prelaunch_b_floor0_inf_balfast":
+        return _pdaps_prelaunch_b_grid(base="floor0_inf", anchors="balfast", log_level=log_level)
+    if preset == "pdaps_prelaunch_baselines":
+        return _prelaunch_baseline_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -424,6 +448,38 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
             "log_level": log_level,
         },
     }
+
+
+def pdaps_working_entry(label_suffix, lgvd_num_steps, sigma_stop_truncate, log_level="INFO"):
+    """
+    Narrow production-tuning surface for the current working P-DAPS core.
+
+    Keep exploratory solver/noise/gate branches out of validation tuning unless
+    a diagnostic preset intentionally reopens them.
+    """
+    entry = pdaps_entry(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=lgvd_num_steps,
+        log_level=log_level,
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+        sigma_stop_truncate=sigma_stop_truncate,
+        label_suffix=label_suffix,
+    )
+    entry["params"]["noise_mode"] = "range_only"
+    return entry
 
 
 def _pdaps_ablations_grid(log_level="INFO"):
@@ -2080,6 +2136,234 @@ def _pdaps_v8f_grid(log_level="INFO"):
     return methods
 
 
+def _pdaps_working_grid(log_level="INFO"):
+    """
+    Small validation-tuning grid for the working P-DAPS core.
+
+    This intentionally exposes only terminal sigma and inner-step budget.
+    Use older v8* presets for diagnostics, not for routine tuning.
+    """
+    return [
+        pdaps_working_entry("working_quality_full_lgvd100_stop0p10", 100, 0.10, log_level=log_level),
+        pdaps_working_entry("working_quality_cut_lgvd100_stop0p14", 100, 0.14, log_level=log_level),
+        pdaps_working_entry("working_balanced_lgvd50_stop0p17", 50, 0.17, log_level=log_level),
+        pdaps_working_entry("working_balanced_lgvd50_stop0p25", 50, 0.25, log_level=log_level),
+        pdaps_working_entry("working_fast_lgvd25_stop0p38", 25, 0.38, log_level=log_level),
+    ]
+
+
+def _pdaps_prelaunch_base_kwargs(base="v8f"):
+    """
+    Shared P-DAPS pre-launch operating points.
+
+    `v8f` is the current-safe base. Other bases are promoted only if C0
+    supports the corresponding lock change.
+    """
+    common = dict(
+        method="P-DAPS",
+        warm_mode="fixed",
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        lgvd_num_steps=50,
+        log_level="INFO",
+        lam_floor=0.0,
+        target_lam_floor=1e-3,
+        solve_lam_floor=3.0,
+        noise_lam_floor=3.0,
+        noise_tau=0.0,
+        noise_mode="range_only",
+        precond_mode="standard",
+        noise_rhs_mode="standard",
+        tau=DAPS_TAU,
+        gamma_schedule="lambda",
+        sigma_stop_truncate=0.17,
+    )
+    if base == "v8f":
+        return common
+    if base == "floor0":
+        common["target_lam_floor"] = 0.0
+        return common
+    if base == "inf":
+        common["inner_sigma_max"] = 1e9
+        return common
+    if base == "floor0_inf":
+        common["target_lam_floor"] = 0.0
+        common["inner_sigma_max"] = 1e9
+        return common
+    raise ValueError(f"Unknown prelaunch base: {base}")
+
+
+def _pdaps_prelaunch_cell(label_suffix, log_level="INFO", base="v8f", **overrides):
+    cfg = _pdaps_prelaunch_base_kwargs(base=base)
+    cfg["log_level"] = log_level
+    cfg.update(overrides)
+    entry = pdaps_entry(**cfg, label_suffix=label_suffix)
+    entry["params"]["noise_mode"] = cfg["noise_mode"]
+    return entry
+
+
+def _pdaps_prelaunch_c0_grid(log_level="INFO"):
+    """
+    Frozen-choice challenge around the current v8f-safe balanced anchor.
+
+    Gate on paired quality, stability, and runtime. If a challenge wins, use the
+    corresponding promoted A preset before spending the larger A/B budget.
+    """
+    return [
+        _pdaps_prelaunch_cell("c0_anchor_v8f_lgvd50_stop0p17", log_level=log_level),
+        _pdaps_prelaunch_cell(
+            "c0_gamma_constant",
+            log_level=log_level,
+            gamma_schedule="constant",
+        ),
+        _pdaps_prelaunch_cell(
+            "c0_target_floor0",
+            log_level=log_level,
+            target_lam_floor=0.0,
+        ),
+        _pdaps_prelaunch_cell(
+            "c0_inner_sigma_inf",
+            log_level=log_level,
+            inner_sigma_max=1e9,
+        ),
+        _pdaps_prelaunch_cell(
+            "c0_noise_tau0p025_range",
+            log_level=log_level,
+            noise_tau=0.025,
+            noise_mode="range_only",
+        ),
+        _pdaps_prelaunch_cell(
+            "c0_solve_floor1",
+            log_level=log_level,
+            solve_lam_floor=1.0,
+        ),
+        _pdaps_prelaunch_cell(
+            "c0_solve_floor5",
+            log_level=log_level,
+            solve_lam_floor=5.0,
+        ),
+    ]
+
+
+def _pdaps_prelaunch_a_grid(base="v8f", log_level="INFO"):
+    """
+    Runtime surface: inner budget x terminal stop on the C0-selected base.
+    """
+    methods = []
+    stops = (
+        ("full", None),
+        ("stop0p10", 0.10),
+        ("stop0p14", 0.14),
+        ("stop0p17", 0.17),
+        ("stop0p25", 0.25),
+        ("stop0p38", 0.38),
+    )
+    for lgvd_num_steps in (25, 50, 100):
+        for stop_label, sigma_stop in stops:
+            methods.append(_pdaps_prelaunch_cell(
+                f"a_{base}_lgvd{lgvd_num_steps}_{stop_label}",
+                base=base,
+                log_level=log_level,
+                lgvd_num_steps=lgvd_num_steps,
+                sigma_stop_truncate=sigma_stop,
+            ))
+    return methods
+
+
+def _pdaps_prelaunch_anchor_defs(anchors):
+    if anchors == "balanced":
+        return (("balanced_lgvd50_stop0p17", 50, 0.17),)
+    if anchors == "balfast":
+        return (
+            ("balanced_lgvd50_stop0p17", 50, 0.17),
+            ("fast_lgvd25_stop0p38", 25, 0.38),
+        )
+    raise ValueError(f"Unknown prelaunch anchors: {anchors}")
+
+
+def _pdaps_prelaunch_b_grid(base="v8f", anchors="balfast", log_level="INFO"):
+    """
+    One-axis tunable-knob audit around one or two A-selected anchors.
+
+    Each anchor contributes nine cells: anchor plus warm/gamma/target-floor
+    one-axis alternatives. This is deliberately not a full factorial.
+    """
+    methods = []
+    for anchor_label, lgvd_num_steps, sigma_stop in _pdaps_prelaunch_anchor_defs(anchors):
+        prefix = f"b_{base}_{anchor_label}"
+        anchor = dict(
+            base=base,
+            log_level=log_level,
+            lgvd_num_steps=lgvd_num_steps,
+            sigma_stop_truncate=sigma_stop,
+        )
+        methods.append(_pdaps_prelaunch_cell(f"{prefix}_anchor", **anchor))
+        for warm_fraction in (0.0, 0.2, 0.5):
+            methods.append(_pdaps_prelaunch_cell(
+                f"{prefix}_warm{str(warm_fraction).replace('.', 'p')}",
+                warm_fraction=warm_fraction,
+                **anchor,
+            ))
+        for gamma in (0.75, 1.0):
+            methods.append(_pdaps_prelaunch_cell(
+                f"{prefix}_gamma{str(gamma).replace('.', 'p')}",
+                gamma=gamma,
+                **anchor,
+            ))
+        for target_lam_floor, floor_label in ((0.0, "0"), (1e-4, "1em4"), (1e-2, "1em2")):
+            methods.append(_pdaps_prelaunch_cell(
+                f"{prefix}_target_floor_{floor_label}",
+                target_lam_floor=target_lam_floor,
+                **anchor,
+            ))
+    return methods
+
+
+def _prelaunch_baseline_grid(log_level="INFO"):
+    """
+    Paired validation calibration baselines. These are not final test claims.
+    """
+    return [
+        {
+            "method": "DPS[prelaunch_calib_g1]",
+            "params": {"guidance_scale": 1.0},
+            "algorithm": {
+                "_target_": "algo.dps.DPS",
+                "diffusion_scheduler_config": DPS_SCHEDULER,
+                "guidance_scale": 1.0,
+            },
+        },
+        {
+            "method": "DAPS[prelaunch_calib_lr3em6]",
+            "params": {"lr": 3e-6, "tau": DAPS_TAU, "lr_min_ratio": 0.01},
+            "algorithm": {
+                "_target_": "algo.daps.DAPS",
+                "annealing_scheduler_config": ANNEALING,
+                "diffusion_scheduler_config": REVERSE_ODE,
+                "lgvd_config": {
+                    "num_steps": 100,
+                    "lr": 3e-6,
+                    "tau": DAPS_TAU,
+                    "lr_min_ratio": 0.01,
+                },
+            },
+        },
+        {
+            "method": "pULA[prelaunch_calib_g0p5]",
+            "params": {"gamma": 0.5},
+            "algorithm": {
+                "_target_": "algo.pula.pULA",
+                "noise_scheduler_config": PULA_SCHEDULER,
+                "K": 4,
+                "gamma": 0.5,
+                "cg_iter": 10,
+                "log_level": log_level,
+            },
+        },
+    ]
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -2729,7 +3013,16 @@ def parse_args():
                                  "pdaps_targeted", "pdaps_mechanism",
                                  "pdaps_nullspace_focus", "pdaps_v2", "pdaps_v3",
                                  "pdaps_v4", "pdaps_v5", "pdaps_v6", "pdaps_v7",
-                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "pdaps_v8e", "pdaps_v8f", "check_abandoned",
+                                 "pdaps_v8a", "pdaps_v8b", "pdaps_v8c", "pdaps_v8d", "pdaps_v8e", "pdaps_v8f",
+                                 "pdaps_working",
+                                 "pdaps_prelaunch_c0",
+                                 "pdaps_prelaunch_a_v8f", "pdaps_prelaunch_a_floor0",
+                                 "pdaps_prelaunch_a_inf", "pdaps_prelaunch_a_floor0_inf",
+                                 "pdaps_prelaunch_b_v8f_balfast", "pdaps_prelaunch_b_v8f_balanced",
+                                 "pdaps_prelaunch_b_floor0_balfast", "pdaps_prelaunch_b_inf_balfast",
+                                 "pdaps_prelaunch_b_floor0_inf_balfast",
+                                 "pdaps_prelaunch_baselines",
+                                 "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
     parser.add_argument("--verbose", action="store_true")
