@@ -249,15 +249,27 @@ class PDAPS(Algo):
 
             if inner_active:
                 x_init = self._init_inner(x_prev, x0hat)
-                x_clean, avg_cg, avg_drift = self._inner_sample(
-                    x_init,
-                    x0hat,
-                    y,
-                    sigma,
-                    i / max(1, n_outer),
-                    return_stats=self.log_level in {"INFO", "DEBUG"},
-                )
-                inner_stats = f" CG={avg_cg:.1f} drift={avg_drift:.3e}" if self.log_level in {"INFO", "DEBUG"} else ""
+                return_stats = self.log_level in {"INFO", "DEBUG"}
+                if return_stats:
+                    x_clean, avg_cg, avg_drift = self._inner_sample(
+                        x_init,
+                        x0hat,
+                        y,
+                        sigma,
+                        i / max(1, n_outer),
+                        return_stats=True,
+                    )
+                    inner_stats = f" CG={avg_cg:.1f} drift={avg_drift:.3e}"
+                else:
+                    x_clean = self._inner_sample(
+                        x_init,
+                        x0hat,
+                        y,
+                        sigma,
+                        i / max(1, n_outer),
+                        return_stats=False,
+                    )
+                    inner_stats = ""
             else:
                 x_clean = x0hat
                 inner_stats = ""

@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -3029,6 +3030,7 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                 row["failed"] = True
                 row["catastrophe_warn"] = False
                 row["error"] = repr(exc)
+                row["traceback"] = traceback.format_exc()
                 row["runtime_s"] = time.perf_counter() - start
 
             status_str = f"[FAILED: {row.get('error', 'unknown')}]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
@@ -3368,6 +3370,10 @@ def _row_key(row):
     )
 
 
+def _successful_row_keys(rows):
+    return {_row_key(row) for row in rows if not row.get("failed")}
+
+
 def _expected_row_key(entry, split, sample_idx, filename, seed, acceleration):
     return _row_key_from_values(
         entry["method"],
@@ -3401,12 +3407,20 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
     selected = None
     if args.resume and selected_path.exists() and not args.evaluate_all:
         with open(selected_path) as f:
-            selected = json.load(f)
-        print(f"Resuming with frozen selection from {selected_path}")
+            candidate_selected = json.load(f)
+        expected_methods = {entry["method"] for entry in entries}
+        if set(candidate_selected) == expected_methods:
+            selected = candidate_selected
+            print(f"Resuming with frozen selection from {selected_path}")
+        else:
+            print(
+                f"Ignoring incomplete selection in {selected_path}: "
+                f"found {sorted(candidate_selected)}, expected {sorted(expected_methods)}"
+            )
 
     val_rows = _load_resume_rows(out_dir / "validation_raw.csv", args.resume)
     if selected is None:
-        val_done = {_row_key(row) for row in val_rows}
+        val_done = _successful_row_keys(val_rows)
         for entry in entries:
             for seed in seed_values:
                 args.seed = int(seed)
@@ -3449,7 +3463,7 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
                 "reason": "skip_test",
             }, f, indent=2)
     else:
-        test_done = {_row_key(row) for row in test_rows}
+        test_done = _successful_row_keys(test_rows)
         for entry in selected_entries:
             for seed in seed_values:
                 args.seed = int(seed)
