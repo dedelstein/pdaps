@@ -3291,7 +3291,7 @@ def _take_file_samples(dataset, by_file, filenames, n_slices, slice_offset, spli
             print(f"Warning: {filename} has only {len(wanted)} usable {split_name} slices at offset "
                   f"{slice_offset} (wanted {n_slices}), using what's available")
         for global_idx in wanted:
-            selected.append((global_idx, filename, dataset[global_idx]))
+            selected.append((global_idx, filename))
     return selected
 
 
@@ -3300,9 +3300,8 @@ def _select_samples(dataset, slice_offset, val_slices, test_slices):
     Pick `val_slices + test_slices` slices from each file in the dataset,
     starting at `slice_offset` within that file. Returns
     (val_samples, test_samples) where each is a list of
-    (global_idx, filename, sample_dict). val_samples is the first
-    `val_slices` from each file; test_samples is the remaining
-    `test_slices` from each file.
+    (global_idx, filename). val_samples is the first `val_slices` from each
+    file; test_samples is the remaining `test_slices` from each file.
     """
     by_file = _samples_by_file(dataset)
 
@@ -3313,7 +3312,7 @@ def _select_samples(dataset, slice_offset, val_slices, test_slices):
             print(f"Warning: {filename} has only {len(wanted)} usable slices at offset "
                   f"{slice_offset} (wanted {val_slices + test_slices}), using what's available")
         for i, global_idx in enumerate(wanted):
-            entry = (global_idx, filename, dataset[global_idx])
+            entry = (global_idx, filename)
             (val_samples if i < val_slices else test_samples).append(entry)
     return val_samples, test_samples
 
@@ -3395,7 +3394,7 @@ def _load_resume_rows(path, enabled):
     return rows
 
 
-def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir):
+def _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
@@ -3424,13 +3423,15 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
         for entry in entries:
             for seed in seed_values:
                 args.seed = int(seed)
-                for idx, filename, sample in val_samples:
+                for idx, filename in val_samples:
                     key = _expected_row_key(entry, "validation", idx, filename, args.seed, args.acceleration)
                     if key in val_done:
                         continue
+                    sample = dataset[idx]
                     row = run_one(entry, sample, idx, "validation", net, args, out_dir,
                                   save_image=(args.evaluate_all or args.save_images),
                                   filename=filename)
+                    del sample
                     val_rows.append(row)
                     val_done.add(_row_key(row))
                     write_csv(out_dir / "validation_raw.csv", val_rows)
@@ -3467,12 +3468,14 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
         for entry in selected_entries:
             for seed in seed_values:
                 args.seed = int(seed)
-                for idx, filename, sample in test_samples:
+                for idx, filename in test_samples:
                     key = _expected_row_key(entry, "test", idx, filename, args.seed, args.acceleration)
                     if key in test_done:
                         continue
+                    sample = dataset[idx]
                     row = run_one(entry, sample, idx, "test", net, args, out_dir,
                                   save_image=True, filename=filename)
+                    del sample
                     test_rows.append(row)
                     test_done.add(_row_key(row))
                     write_csv(out_dir / "test_raw.csv", test_rows)
@@ -3537,13 +3540,13 @@ def run_validation(args):
     accelerations = args.accelerations if args.accelerations else [args.acceleration]
     if len(accelerations) == 1:
         args.acceleration = accelerations[0]
-        _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir)
+        _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples, out_dir)
     else:
         for accel in accelerations:
             args.acceleration = accel
             sub_dir = out_dir / f"accel_{accel}"
             print(f"=== acceleration {accel}x → {sub_dir} ===")
-            _run_one_acceleration(args, entries, net, val_samples, test_samples, sub_dir)
+            _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples, sub_dir)
         if args.evaluate_all:
             write_combined_acceleration_artifacts(out_dir, accelerations)
     return out_dir
