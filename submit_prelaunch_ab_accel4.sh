@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ACCEL=4
-GRID_PRESET="pdaps_prelaunch_a_v8f"
+GRID_PRESET="pdaps_prelaunch_b_v8f_balfast"
 VAL_SLICES=2
 SLICE_OFFSET=0
 ROOT_ID=${LSB_JOBID:-$(date +%Y%m%d_%H%M%S)}

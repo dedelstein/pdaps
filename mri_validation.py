@@ -2273,10 +2273,10 @@ def _pdaps_prelaunch_a_grid(base="v8f", log_level="INFO"):
 
 def _pdaps_prelaunch_anchor_defs(anchors):
     if anchors == "balanced":
-        return (("balanced_lgvd50_stop0p17", 50, 0.17),)
+        return (("balanced_lgvd50_stop0p25", 50, 0.25),)
     if anchors == "balfast":
         return (
-            ("balanced_lgvd50_stop0p17", 50, 0.17),
+            ("balanced_lgvd50_stop0p25", 50, 0.25),
             ("fast_lgvd25_stop0p38", 25, 0.38),
         )
     raise ValueError(f"Unknown prelaunch anchors: {anchors}")

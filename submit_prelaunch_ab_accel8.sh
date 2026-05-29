@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ACCEL=8
-GRID_PRESET="pdaps_prelaunch_a_v8f"
+GRID_PRESET="pdaps_prelaunch_b_v8f_balfast"
 SEEDS=(123)
 FILENAMES=(file1000196.h5 file1001458.h5 file1002451.h5)
 VAL_SLICES=2
