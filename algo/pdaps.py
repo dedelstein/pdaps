@@ -25,6 +25,7 @@ class MRIInnerPULA:
         finite_check_interval=1,
         lam_floor=0.0,
         target_lam_floor=None,
+        target_null_lam_floor=None,
         solve_lam_floor=None,
         noise_lam_floor=None,
         noise_tau=1.0,
@@ -55,6 +56,9 @@ class MRIInnerPULA:
         # up the M⁻¹ noise. Setting lam_floor > 0 keeps the inner well-conditioned.
         self.lam_floor = float(lam_floor)
         self.target_lam_floor = float(lam_floor if target_lam_floor is None else target_lam_floor)
+        self.target_null_lam_floor = float(
+            self.target_lam_floor if target_null_lam_floor is None else target_null_lam_floor
+        )
         self.solve_lam_floor = float(lam_floor if solve_lam_floor is None else solve_lam_floor)
         self.noise_lam_floor = float(lam_floor if noise_lam_floor is None else noise_lam_floor)
         # noise_tau: temperature on the Langevin noise. 1.0 = standard pULA;
@@ -133,6 +137,7 @@ class MRIInnerPULA:
         return {
             "raw": lam_raw,
             "target": max(lam_target_raw, self.target_lam_floor),
+            "target_null": max(lam_target_raw, self.target_null_lam_floor),
             "solve": max(lam_raw, self.solve_lam_floor),
             "noise": max(lam_raw, self.noise_lam_floor),
         }
@@ -174,6 +179,7 @@ class MRIInnerPULA:
         lams = self.lambdas(sigma)
         lam_raw = lams["raw"]
         lam_target = lams["target"]
+        lam_target_null = lams["target_null"]
         lam_solve = lams["solve"]
         lam_noise = lams["noise"]
         gamma = self.effective_gamma(sigma, ratio)
@@ -184,7 +190,14 @@ class MRIInnerPULA:
             return t.abs().max().item() if isinstance(t, torch.Tensor) else 0.0
 
         score_lik = pdaps.AH(y - pdaps.A(x))
-        score_prior = -(x - x0hat) * lam_target
+        delta = x - x0hat
+        if lam_target_null == lam_target:
+            score_prior = -delta * lam_target
+        else:
+            score_prior = -(
+                pdaps.project_range(delta) * lam_target
+                + pdaps.project_null(delta) * lam_target_null
+            )
         drift_rhs = score_lik + score_prior
         drift = pdaps.solve_precond(
             drift_rhs,
