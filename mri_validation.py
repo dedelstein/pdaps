@@ -97,6 +97,8 @@ class _Tee(io.TextIOBase):
 
 
 def method_grid(preset="tiny", log_level="INFO"):
+    if preset == "final_comparison":
+        return _final_comparison_grid(log_level=log_level)
     if preset == "pdaps_ablations":
         return _pdaps_ablations_grid(log_level=log_level)
     if preset == "pdaps_remediation":
@@ -307,6 +309,52 @@ def method_grid(preset="tiny", log_level="INFO"):
 PDAPS_INNER_SIGMA_MAX = 0.3
 
 
+def _baseline_entries(dps_scales, daps_lrs, pula_gammas, log_level="INFO"):
+    methods = []
+    for p in grid({"guidance_scale": dps_scales}):
+        methods.append({
+            "method": "DPS",
+            "params": p,
+            "algorithm": {
+                "_target_": "algo.dps.DPS",
+                "diffusion_scheduler_config": DPS_SCHEDULER,
+                "guidance_scale": p["guidance_scale"],
+            },
+        })
+
+    for p in grid({"lr": daps_lrs}):
+        methods.append({
+            "method": "DAPS",
+            "params": p,
+            "algorithm": {
+                "_target_": "algo.daps.DAPS",
+                "annealing_scheduler_config": ANNEALING,
+                "diffusion_scheduler_config": REVERSE_ODE,
+                "lgvd_config": {
+                    "num_steps": 100,
+                    "lr": p["lr"],
+                    "tau": DAPS_TAU,
+                    "lr_min_ratio": 0.01,
+                },
+            },
+        })
+
+    for p in grid({"gamma": pula_gammas}):
+        methods.append({
+            "method": "pULA",
+            "params": p,
+            "algorithm": {
+                "_target_": "algo.pula.pULA",
+                "noise_scheduler_config": PULA_SCHEDULER,
+                "K": 4,
+                "gamma": p["gamma"],
+                "cg_iter": 10,
+                "log_level": log_level,
+            },
+        })
+    return methods
+
+
 def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 inner_sigma_max=PDAPS_INNER_SIGMA_MAX, lgvd_num_steps=25, log_level="INFO",
                 lam_floor=0.0, target_lam_floor=None, solve_lam_floor=None,
@@ -462,6 +510,110 @@ def pdaps_working_entry(label_suffix, lgvd_num_steps, sigma_stop_truncate, log_l
     Keep exploratory solver/noise/gate branches out of validation tuning unless
     a diagnostic preset intentionally reopens them.
     """
+    return pdaps_core_entry(
+        label_suffix=label_suffix,
+        lgvd_num_steps=lgvd_num_steps,
+        sigma_stop_truncate=sigma_stop_truncate,
+        log_level=log_level,
+    )
+
+
+def pdaps_core_entry(
+        label_suffix,
+        lgvd_num_steps,
+        sigma_stop_truncate,
+        gamma=0.5,
+        warm_fraction=0.8,
+        inner_sigma_max=5.0,
+        solve_lam_floor=3.0,
+        lr_min_ratio=0.01,
+        cg_iter=10,
+        tau=DAPS_TAU,
+        log_level="INFO"):
+    """
+    Slim production P-DAPS entry.
+
+    Deleted branches from algo.pdaps.PDAPS are intentionally absent here:
+    inner noise, nonstandard preconditioners, target lambda floors, residual
+    gates, reanchor/projection, and warm-init variants.
+    """
+    inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
+    params = {
+        "gamma": float(gamma),
+        "warm_fraction": float(warm_fraction),
+        "inner_sigma_max": inner_str,
+        "lgvd_num_steps": int(lgvd_num_steps),
+        "tau": float(tau),
+        "solve_lam_floor": float(solve_lam_floor),
+        "lr_min_ratio": float(lr_min_ratio),
+    }
+    if sigma_stop_truncate is not None:
+        params["sigma_stop_truncate"] = float(sigma_stop_truncate)
+    if cg_iter != 10:
+        params["cg_iter"] = int(cg_iter)
+    return {
+        "method": f"P-DAPS-core[{label_suffix}]",
+        "params": params,
+        "algorithm": {
+            "_target_": "algo.pdaps_core.PDAPS",
+            "annealing_scheduler_config": ANNEALING,
+            "diffusion_scheduler_config": REVERSE_ODE,
+            "lgvd_config": {
+                "num_steps": int(lgvd_num_steps),
+                "gamma": float(gamma),
+                "tau": float(tau),
+                "solve_lam_floor": float(solve_lam_floor),
+                "lr_min_ratio": float(lr_min_ratio),
+                "cg_iter": int(cg_iter),
+            },
+            "warm_fraction": float(warm_fraction),
+            "inner_sigma_max": float(inner_sigma_max),
+            "sigma_stop_truncate": None if sigma_stop_truncate is None else float(sigma_stop_truncate),
+            "log_level": log_level,
+        },
+    }
+
+
+def _final_comparison_grid(log_level="INFO"):
+    """
+    Pre-registered final head-to-head grid.
+
+    Selection is by validation SSIM only; PSNR and data misfit are secondary
+    tie-breakers. Test rows should be generated only after selected.json is
+    frozen for the disjoint patient split.
+    """
+    methods = _baseline_entries(
+        dps_scales=[0.5, 1.0, 2.0],
+        daps_lrs=[3e-6, 1e-5, 3e-5],
+        pula_gammas=[0.25, 0.5, 1.0],
+        log_level=log_level,
+    )
+    for p in grid({
+        "lgvd_num_steps": [25, 50],
+        "sigma_stop_truncate": [0.17, 0.25, 0.38],
+        "gamma": [0.5, 0.75],
+    }):
+        stop_label = f"{p['sigma_stop_truncate']:g}".replace(".", "p")
+        gamma_label = f"{p['gamma']:g}".replace(".", "p")
+        entry = pdaps_core_entry(
+            label_suffix=(
+                f"final_lgvd{p['lgvd_num_steps']}_"
+                f"stop{stop_label}_gamma{gamma_label}"
+            ),
+            lgvd_num_steps=p["lgvd_num_steps"],
+            sigma_stop_truncate=p["sigma_stop_truncate"],
+            gamma=p["gamma"],
+            warm_fraction=0.8,
+            inner_sigma_max=5.0,
+            log_level=log_level,
+        )
+        entry["params"]["candidate"] = entry["method"]
+        entry["method"] = "P-DAPS-core"
+        methods.append(entry)
+    return methods
+
+
+def pdaps_legacy_working_entry(label_suffix, lgvd_num_steps, sigma_stop_truncate, log_level="INFO"):
     entry = pdaps_entry(
         method="P-DAPS",
         warm_mode="fixed",
@@ -2208,6 +2360,24 @@ def _pdaps_prelaunch_cell(label_suffix, log_level="INFO", base="v8f", **override
     return entry
 
 
+def _pdaps_prelaunch_core_cell(label_suffix, log_level="INFO", base="v8f", **overrides):
+    cfg = _pdaps_prelaunch_base_kwargs(base=base)
+    cfg["log_level"] = log_level
+    cfg.update(overrides)
+    return pdaps_core_entry(
+        label_suffix=label_suffix,
+        lgvd_num_steps=cfg["lgvd_num_steps"],
+        sigma_stop_truncate=cfg["sigma_stop_truncate"],
+        gamma=cfg["gamma"],
+        warm_fraction=cfg["warm_fraction"],
+        inner_sigma_max=cfg["inner_sigma_max"],
+        solve_lam_floor=cfg["solve_lam_floor"],
+        lr_min_ratio=cfg.get("lr_min_ratio", 0.01),
+        tau=cfg["tau"],
+        log_level=log_level,
+    )
+
+
 def _pdaps_prelaunch_c0_grid(log_level="INFO"):
     """
     Frozen-choice challenge around the current v8f-safe balanced anchor.
@@ -2266,7 +2436,7 @@ def _pdaps_prelaunch_a_grid(base="v8f", log_level="INFO"):
     )
     for lgvd_num_steps in (25, 50, 100):
         for stop_label, sigma_stop in stops:
-            methods.append(_pdaps_prelaunch_cell(
+            methods.append(_pdaps_prelaunch_core_cell(
                 f"a_{base}_lgvd{lgvd_num_steps}_{stop_label}",
                 base=base,
                 log_level=log_level,
@@ -2291,8 +2461,8 @@ def _pdaps_prelaunch_b_grid(base="v8f", anchors="balfast", log_level="INFO"):
     """
     One-axis tunable-knob audit around one or two A-selected anchors.
 
-    Each anchor contributes nine cells: anchor plus warm/gamma/target-floor
-    one-axis alternatives. This is deliberately not a full factorial.
+    Each anchor contributes six cells: anchor plus warm/gamma one-axis
+    alternatives. Target lambda flooring was deleted from the core after C0/B.
     """
     methods = []
     for anchor_label, lgvd_num_steps, sigma_stop in _pdaps_prelaunch_anchor_defs(anchors):
@@ -2303,23 +2473,17 @@ def _pdaps_prelaunch_b_grid(base="v8f", anchors="balfast", log_level="INFO"):
             lgvd_num_steps=lgvd_num_steps,
             sigma_stop_truncate=sigma_stop,
         )
-        methods.append(_pdaps_prelaunch_cell(f"{prefix}_anchor", **anchor))
+        methods.append(_pdaps_prelaunch_core_cell(f"{prefix}_anchor", **anchor))
         for warm_fraction in (0.0, 0.2, 0.5):
-            methods.append(_pdaps_prelaunch_cell(
+            methods.append(_pdaps_prelaunch_core_cell(
                 f"{prefix}_warm{str(warm_fraction).replace('.', 'p')}",
                 warm_fraction=warm_fraction,
                 **anchor,
             ))
         for gamma in (0.75, 1.0):
-            methods.append(_pdaps_prelaunch_cell(
+            methods.append(_pdaps_prelaunch_core_cell(
                 f"{prefix}_gamma{str(gamma).replace('.', 'p')}",
                 gamma=gamma,
-                **anchor,
-            ))
-        for target_lam_floor, floor_label in ((0.0, "0"), (1e-4, "1em4"), (1e-2, "1em2")):
-            methods.append(_pdaps_prelaunch_cell(
-                f"{prefix}_target_floor_{floor_label}",
-                target_lam_floor=target_lam_floor,
                 **anchor,
             ))
     return methods
@@ -2377,7 +2541,7 @@ def _pdaps_prelaunch_lrmin_grid(log_level="INFO"):
     no terminal decay. Intended scale: one file, one slice, one seed, accel 4/8.
     """
     return [
-        _pdaps_prelaunch_cell(
+        _pdaps_prelaunch_core_cell(
             "lrmin_balanced_lgvd50_stop0p25_ratio0p01",
             log_level=log_level,
             lgvd_num_steps=50,
@@ -2385,7 +2549,7 @@ def _pdaps_prelaunch_lrmin_grid(log_level="INFO"):
             gamma=0.5,
             lr_min_ratio=0.01,
         ),
-        _pdaps_prelaunch_cell(
+        _pdaps_prelaunch_core_cell(
             "lrmin_balanced_lgvd50_stop0p25_ratio1p0",
             log_level=log_level,
             lgvd_num_steps=50,
@@ -2797,7 +2961,7 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
     seed_suffix = f"_seed{args.seed}" if seeds and len(seeds) > 1 else ""
     log_path = log_dir / f"{sanitized_method}_{split}_{sample_idx}{seed_suffix}.log"
     trace_path = None
-    if entry["algorithm"]["_target_"] == "algo.pdaps.PDAPS" and args.log_level == "DEBUG":
+    if entry["algorithm"]["_target_"] in {"algo.pdaps.PDAPS", "algo.pdaps_core.PDAPS"} and args.log_level == "DEBUG":
         trace_dir = out_dir / "trajectories" / f"accel_{args.acceleration}"
         trace_dir.mkdir(parents=True, exist_ok=True)
         trace_path = trace_dir / f"{sanitized_method}_{split}_{sample_idx}{seed_suffix}.npz"
@@ -2985,12 +3149,16 @@ def write_combined_acceleration_artifacts(out_dir, accelerations):
 
 
 def select_best(validation_summary):
+    """
+    Pre-registered selection rule: maximize validation SSIM, then use PSNR and
+    lower data misfit only as tie-breakers.
+    """
     best = {}
     for row in validation_summary:
         if row["n_ok"] == 0:
             continue
         current = best.get(row["method"])
-        candidate = (row.get("psnr_mean", -1e9), row.get("ssim_mean", -1e9), -row.get("data_misfit_mean", 1e9))
+        candidate = (row.get("ssim_mean", -1e9), row.get("psnr_mean", -1e9), -row.get("data_misfit_mean", 1e9))
         if current is None or candidate > current[0]:
             best[row["method"]] = (candidate, row["params_json"])
     return {method: params_json for method, (_, params_json) in best.items()}
@@ -3007,6 +3175,10 @@ def parse_args():
                         help="Multiple filenames for multi-patient runs. If given, "
                              "--val-slices and --test-slices are interpreted *per file*. "
                              "Overrides --filename.")
+    parser.add_argument("--test-filenames", nargs="+", default=None,
+                        help="Patient files reserved for test. When set, --filenames are "
+                             "validation patients and must be disjoint from --test-filenames. "
+                             "Without this, the legacy within-file slice split is used.")
     parser.add_argument("--image-size", nargs=2, type=int, default=[320, 320])
     parser.add_argument("--acceleration", type=int, default=4)
     parser.add_argument("--accelerations", nargs="+", type=int, default=None,
@@ -3023,6 +3195,8 @@ def parse_args():
     parser.add_argument("--test-same-as-val", action="store_true",
                         help="Reuse validation samples as the test split. Useful for single-slice ablations.")
     parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing raw CSV rows in --out-dir and reuse selected.json if present.")
     parser.add_argument("--methods", default=None,
                         help="Comma-separated list of exact methods to run (e.g. pULA,P-DAPS)")
     parser.add_argument("--methods-include", default=None,
@@ -3039,7 +3213,7 @@ def parse_args():
     parser.add_argument("--save-images", action="store_true",
                         help="Save reconstruction figures for validation rows as well as test rows.")
     parser.add_argument("--grid-preset",
-                        choices=("smoke", "tiny", "probe", "full", "pdaps_inner_sweep",
+                        choices=("smoke", "tiny", "probe", "full", "final_comparison", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
                                  "pdaps_ablations", "pdaps_remediation",
                                  "pdaps_targeted", "pdaps_mechanism",
@@ -3086,6 +3260,39 @@ def parse_index_selection(raw, n_entries):
     return selected
 
 
+def _normalize_filenames(filenames):
+    out = []
+    for filename in filenames:
+        name = Path(filename).name
+        if name in out:
+            raise ValueError(f"Duplicate filename in split: {name}")
+        out.append(name)
+    return out
+
+
+def _samples_by_file(dataset):
+    by_file = {}
+    for global_idx, (kspace_path, _maps_path, _slice) in enumerate(dataset.samples):
+        by_file.setdefault(kspace_path.name, []).append(global_idx)
+    return by_file
+
+
+def _take_file_samples(dataset, by_file, filenames, n_slices, slice_offset, split_name):
+    selected = []
+    missing = [filename for filename in filenames if filename not in by_file]
+    if missing:
+        raise ValueError(f"{split_name} filenames have no indexed slices: {missing}")
+    for filename in filenames:
+        global_indices = by_file[filename]
+        wanted = global_indices[slice_offset:slice_offset + n_slices]
+        if len(wanted) < n_slices:
+            print(f"Warning: {filename} has only {len(wanted)} usable {split_name} slices at offset "
+                  f"{slice_offset} (wanted {n_slices}), using what's available")
+        for global_idx in wanted:
+            selected.append((global_idx, filename, dataset[global_idx]))
+    return selected
+
+
 def _select_samples(dataset, slice_offset, val_slices, test_slices):
     """
     Pick `val_slices + test_slices` slices from each file in the dataset,
@@ -3095,9 +3302,7 @@ def _select_samples(dataset, slice_offset, val_slices, test_slices):
     `val_slices` from each file; test_samples is the remaining
     `test_slices` from each file.
     """
-    by_file = {}
-    for global_idx, (kspace_path, _maps_path, _slice) in enumerate(dataset.samples):
-        by_file.setdefault(kspace_path.name, []).append(global_idx)
+    by_file = _samples_by_file(dataset)
 
     val_samples, test_samples = [], []
     for filename, global_indices in by_file.items():
@@ -3111,6 +3316,79 @@ def _select_samples(dataset, slice_offset, val_slices, test_slices):
     return val_samples, test_samples
 
 
+def _select_patient_disjoint_samples(dataset, val_filenames, test_filenames,
+                                     slice_offset, val_slices, test_slices):
+    """
+    Pick validation and test samples from disjoint patient files. Each HDF5
+    file is treated as one patient; slice selection starts after the dataset's
+    central-slice crop and then applies `slice_offset`.
+    """
+    val_filenames = _normalize_filenames(val_filenames)
+    test_filenames = _normalize_filenames(test_filenames)
+    overlap = sorted(set(val_filenames) & set(test_filenames))
+    if overlap:
+        raise ValueError(
+            "Patient leakage guard: --filenames and --test-filenames overlap: "
+            + ", ".join(overlap)
+        )
+
+    by_file = _samples_by_file(dataset)
+    val_samples = _take_file_samples(dataset, by_file, val_filenames, val_slices,
+                                     slice_offset, "validation")
+    test_samples = _take_file_samples(dataset, by_file, test_filenames, test_slices,
+                                      slice_offset, "test")
+    print("Patient-disjoint partition:")
+    print(f"  validation patients ({len(val_filenames)}): {', '.join(val_filenames)}")
+    print(f"  test patients ({len(test_filenames)}): {', '.join(test_filenames)}")
+    print(f"  selected slices: {len(val_samples)} validation + {len(test_samples)} test")
+    return val_samples, test_samples
+
+
+def _row_key_from_values(method, params_json, split, sample_idx, filename, seed, acceleration):
+    return (
+        str(method),
+        str(params_json),
+        str(split),
+        str(sample_idx),
+        str(filename),
+        str(seed),
+        str(acceleration),
+    )
+
+
+def _row_key(row):
+    return _row_key_from_values(
+        row.get("method"),
+        row.get("params_json"),
+        row.get("split"),
+        row.get("sample_idx"),
+        row.get("filename"),
+        row.get("seed"),
+        row.get("acceleration"),
+    )
+
+
+def _expected_row_key(entry, split, sample_idx, filename, seed, acceleration):
+    return _row_key_from_values(
+        entry["method"],
+        json.dumps(entry["params"], sort_keys=True),
+        split,
+        sample_idx,
+        filename,
+        seed,
+        acceleration,
+    )
+
+
+def _load_resume_rows(path, enabled):
+    if not enabled:
+        return []
+    rows = read_csv_rows(path)
+    if rows:
+        print(f"Resuming with {len(rows)} existing rows from {path}")
+    return rows
+
+
 def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "args.json", "w") as f:
@@ -3119,15 +3397,32 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
         json.dump(entries, f, indent=2)
 
     seed_values = list(args.seeds) if getattr(args, "seeds", None) else [args.seed]
-    val_rows = []
-    for entry in entries:
-        for seed in seed_values:
-            args.seed = int(seed)
-            for idx, filename, sample in val_samples:
-                val_rows.append(run_one(entry, sample, idx, "validation", net, args, out_dir,
-                                        save_image=(args.evaluate_all or args.save_images),
-                                        filename=filename))
-                write_csv(out_dir / "validation_raw.csv", val_rows)
+    selected_path = out_dir / "selected.json"
+    selected = None
+    if args.resume and selected_path.exists() and not args.evaluate_all:
+        with open(selected_path) as f:
+            selected = json.load(f)
+        print(f"Resuming with frozen selection from {selected_path}")
+
+    val_rows = _load_resume_rows(out_dir / "validation_raw.csv", args.resume)
+    if selected is None:
+        val_done = {_row_key(row) for row in val_rows}
+        for entry in entries:
+            for seed in seed_values:
+                args.seed = int(seed)
+                for idx, filename, sample in val_samples:
+                    key = _expected_row_key(entry, "validation", idx, filename, args.seed, args.acceleration)
+                    if key in val_done:
+                        continue
+                    row = run_one(entry, sample, idx, "validation", net, args, out_dir,
+                                  save_image=(args.evaluate_all or args.save_images),
+                                  filename=filename)
+                    val_rows.append(row)
+                    val_done.add(_row_key(row))
+                    write_csv(out_dir / "validation_raw.csv", val_rows)
+    elif val_rows:
+        print("Skipping validation execution because selected.json is already frozen.")
+
     val_summary = summarize(val_rows)
     write_csv(out_dir / "validation_summary.csv", val_summary)
 
@@ -3136,12 +3431,16 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
         with open(out_dir / "evaluation_plan.json", "w") as f:
             json.dump({"mode": "evaluate_all", "num_entries": len(entries)}, f, indent=2)
     else:
-        selected = select_best(val_summary)
-        selected_entries = [entry for entry in entries if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)]
-        with open(out_dir / "selected.json", "w") as f:
-            json.dump(selected, f, indent=2)
+        if selected is None:
+            selected = select_best(val_summary)
+            with open(selected_path, "w") as f:
+                json.dump(selected, f, indent=2)
+        selected_entries = [
+            entry for entry in entries
+            if selected.get(entry["method"]) == json.dumps(entry["params"], sort_keys=True)
+        ]
 
-    test_rows = []
+    test_rows = _load_resume_rows(out_dir / "test_raw.csv", args.resume)
     if args.skip_test:
         with open(out_dir / "evaluation_plan.json", "w") as f:
             json.dump({
@@ -3150,12 +3449,18 @@ def _run_one_acceleration(args, entries, net, val_samples, test_samples, out_dir
                 "reason": "skip_test",
             }, f, indent=2)
     else:
+        test_done = {_row_key(row) for row in test_rows}
         for entry in selected_entries:
             for seed in seed_values:
                 args.seed = int(seed)
                 for idx, filename, sample in test_samples:
-                    test_rows.append(run_one(entry, sample, idx, "test", net, args, out_dir,
-                                             save_image=True, filename=filename))
+                    key = _expected_row_key(entry, "test", idx, filename, args.seed, args.acceleration)
+                    if key in test_done:
+                        continue
+                    row = run_one(entry, sample, idx, "test", net, args, out_dir,
+                                  save_image=True, filename=filename)
+                    test_rows.append(row)
+                    test_done.add(_row_key(row))
                     write_csv(out_dir / "test_raw.csv", test_rows)
         write_csv(out_dir / "test_summary.csv", summarize(test_rows))
     if args.evaluate_all or args.skip_test:
@@ -3194,15 +3499,26 @@ def run_validation(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = load_model(args, device)
 
-    files = args.filenames if args.filenames else [args.filename]
+    val_files = _normalize_filenames(args.filenames if args.filenames else [args.filename])
+    test_files = _normalize_filenames(args.test_filenames) if getattr(args, "test_filenames", None) else None
+    if test_files:
+        if getattr(args, "test_same_as_val", False):
+            raise ValueError("--test-same-as-val cannot be combined with patient-disjoint --test-filenames")
+        files = val_files + [filename for filename in test_files if filename not in set(val_files)]
+    else:
+        files = val_files
     dataset = MultiCoilMRIDataset(args.kspace_dir, args.maps_dir, args.image_size, filenames=files)
-    val_samples, test_samples = _select_samples(dataset, args.slice_offset,
-                                                args.val_slices, args.test_slices)
-    if getattr(args, "test_same_as_val", False):
-        test_samples = list(val_samples)
-    print(f"Selected {len(val_samples)} val + {len(test_samples)} test slices "
-          f"across {len(files)} file(s) "
-          f"({args.val_slices} val + {args.test_slices} test per file).")
+    if test_files:
+        val_samples, test_samples = _select_patient_disjoint_samples(
+            dataset, val_files, test_files, args.slice_offset, args.val_slices, args.test_slices)
+    else:
+        val_samples, test_samples = _select_samples(dataset, args.slice_offset,
+                                                    args.val_slices, args.test_slices)
+        if getattr(args, "test_same_as_val", False):
+            test_samples = list(val_samples)
+        print(f"Selected {len(val_samples)} val + {len(test_samples)} test slices "
+              f"across {len(files)} file(s) "
+              f"({args.val_slices} val + {args.test_slices} test per file).")
 
     accelerations = args.accelerations if args.accelerations else [args.acceleration]
     if len(accelerations) == 1:
@@ -3228,6 +3544,7 @@ def run_from_hydra(cfg):
         maps_dir=cfg.dataset.maps_dir,
         filename=validation.get("filename", cfg.dataset.get("filenames", ["file1000196.h5"])[0]),
         filenames=list(validation.get("filenames", cfg.dataset.get("filenames", []))) or None,
+        test_filenames=list(validation.get("test_filenames", [])) or None,
         image_size=list(cfg.dataset.image_size),
         acceleration=int(cfg.forward_op.acceleration_ratio),
         accelerations=[int(a) for a in validation.get("accelerations", [])] or None,
@@ -3240,10 +3557,12 @@ def run_from_hydra(cfg):
         test_slices=int(validation.get("test_slices", 3)),
         test_same_as_val=bool(validation.get("test_same_as_val", False)),
         out_dir=validation.get("out_dir", None),
+        resume=bool(validation.get("resume", False)),
         verbose=bool(validation.get("verbose", False)),
         list_grid=bool(validation.get("list_grid", False)),
         grid_preset=validation.get("grid_preset", "tiny"),
         methods=validation.get("methods", None),
+        methods_include=validation.get("methods_include", None),
         log_level=validation.get("log_level", "VAL"),
         evaluate_all=bool(validation.get("evaluate_all", False)),
         save_images=bool(validation.get("save_images", False)),
