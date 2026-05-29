@@ -153,6 +153,8 @@ def method_grid(preset="tiny", log_level="INFO"):
         return _pdaps_prelaunch_b_grid(base="floor0_inf", anchors="balfast", log_level=log_level)
     if preset == "pdaps_prelaunch_baselines":
         return _prelaunch_baseline_grid(log_level=log_level)
+    if preset == "pdaps_prelaunch_lrmin":
+        return _pdaps_prelaunch_lrmin_grid(log_level=log_level)
     if preset == "check_abandoned":
         return _pdaps_check_abandoned_grid(log_level=log_level)
     if preset == "pdaps_bugcheck":
@@ -322,6 +324,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
                 annealing_override=None,
                 sigma_stop_truncate=None,
                 tau=1.0,
+                lr_min_ratio=0.01,
                 label_suffix=""):
     inner_str = "inf" if inner_sigma_max >= 1e8 else f"{inner_sigma_max:g}"
     params = {
@@ -330,6 +333,8 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
     }
     if tau != 1.0:
         params["tau"] = float(tau)
+    if lr_min_ratio != 0.01:
+        params["lr_min_ratio"] = float(lr_min_ratio)
     if lam_floor > 0.0:
         params["lam_floor"] = float(lam_floor)
     if target_lam_floor is not None:
@@ -388,7 +393,7 @@ def pdaps_entry(method, warm_mode, gamma, warm_fraction,
         "num_steps": int(lgvd_num_steps),
         "gamma": gamma,
         "cg_iter": 10,
-        "lr_min_ratio": 0.01,
+        "lr_min_ratio": float(lr_min_ratio),
         "tau": float(tau),
         "lam_floor": float(lam_floor),
         "noise_tau": float(noise_tau),
@@ -2364,6 +2369,33 @@ def _prelaunch_baseline_grid(log_level="INFO"):
     ]
 
 
+def _pdaps_prelaunch_lrmin_grid(log_level="INFO"):
+    """
+    Tiny check for the inherited DAPS terminal gamma decay.
+
+    Runs the selected balanced production point with lr_min_ratio=0.01 versus
+    no terminal decay. Intended scale: one file, one slice, one seed, accel 4/8.
+    """
+    return [
+        _pdaps_prelaunch_cell(
+            "lrmin_balanced_lgvd50_stop0p25_ratio0p01",
+            log_level=log_level,
+            lgvd_num_steps=50,
+            sigma_stop_truncate=0.25,
+            gamma=0.5,
+            lr_min_ratio=0.01,
+        ),
+        _pdaps_prelaunch_cell(
+            "lrmin_balanced_lgvd50_stop0p25_ratio1p0",
+            log_level=log_level,
+            lgvd_num_steps=50,
+            sigma_stop_truncate=0.25,
+            gamma=0.5,
+            lr_min_ratio=1.0,
+        ),
+    ]
+
+
 def _pdaps_check_abandoned_grid(log_level="INFO"):
     """
     Post-v8b audit grid for live knobs and crosses not covered by v8c.
@@ -3021,7 +3053,7 @@ def parse_args():
                                  "pdaps_prelaunch_b_v8f_balfast", "pdaps_prelaunch_b_v8f_balanced",
                                  "pdaps_prelaunch_b_floor0_balfast", "pdaps_prelaunch_b_inf_balfast",
                                  "pdaps_prelaunch_b_floor0_inf_balfast",
-                                 "pdaps_prelaunch_baselines",
+                                 "pdaps_prelaunch_baselines", "pdaps_prelaunch_lrmin",
                                  "check_abandoned",
                                  "pdaps_bugcheck", "warm_sweep"),
                         default="tiny")
