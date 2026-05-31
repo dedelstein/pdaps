@@ -12,7 +12,8 @@
 #BSUB -e logs/final_cmp_a4.%J.err
 
 set -euo pipefail
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+unset PYTORCH_CUDA_ALLOC_CONF
 
 ACCEL=4
 GRID_PRESET="final_comparison"
@@ -48,6 +49,5 @@ echo "Run started at $(date -Is)" | tee -a "$OUT_ROOT/run.log"
     --pattern random \
     --mask-seed 0 \
     --out-dir "$OUT_ROOT" \
-    --resume \
     --log-level VAL \
     2>&1 | tee -a "$OUT_ROOT/run.log"

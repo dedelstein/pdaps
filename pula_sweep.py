@@ -29,9 +29,13 @@ from mri_validation import (
 
 
 def parse_regime(raw):
-    if ":" not in raw:
-        raise argparse.ArgumentTypeError(f"Expected SIGMA_MAX:NUM_STEPS, got {raw!r}")
-    sigma_s, steps_s = raw.split(":", 1)
+    parts = raw.split(":")
+    if len(parts) not in (2, 4):
+        raise argparse.ArgumentTypeError(
+            f"Expected SIGMA_MAX:NUM_STEPS[:SCHEDULE:TIMESTEP], got {raw!r}"
+        )
+    sigma_s, steps_s = parts[:2]
+    schedule, timestep = ("sqrt", "log") if len(parts) == 2 else parts[2:]
     try:
         sigma_max = float(sigma_s)
         num_steps = int(steps_s)
@@ -39,27 +43,38 @@ def parse_regime(raw):
         raise argparse.ArgumentTypeError(f"Invalid regime {raw!r}") from exc
     if sigma_max <= 0 or num_steps <= 0:
         raise argparse.ArgumentTypeError(f"Regime values must be positive, got {raw!r}")
-    return sigma_max, num_steps
+    if schedule not in {"sqrt", "linear", "vp"}:
+        raise argparse.ArgumentTypeError(
+            f"Invalid schedule {schedule!r}; expected one of sqrt, linear, vp"
+        )
+    if timestep not in {"log", "vp"} and not (
+        timestep.startswith("poly-") and timestep.removeprefix("poly-").isdigit()
+    ):
+        raise argparse.ArgumentTypeError(
+            f"Invalid timestep {timestep!r}; expected log, vp, or poly-<int>"
+        )
+    return sigma_max, num_steps, schedule, timestep
 
 
-def regime_label(sigma_max, num_steps):
+def regime_label(sigma_max, num_steps, schedule, timestep):
     sigma = f"{sigma_max:g}".replace(".", "p")
-    return f"smax{sigma}_N{num_steps}"
+    timestep_label = timestep.replace("-", "")
+    return f"smax{sigma}_N{num_steps}_{schedule}_{timestep_label}"
 
 
 def make_pula_entries(regimes, gammas, log_level, k_steps, cg_iter):
     entries = []
-    for sigma_max, num_steps in regimes:
+    for sigma_max, num_steps, schedule, timestep in regimes:
         scheduler = {
             "num_steps": int(num_steps),
             "sigma_max": float(sigma_max),
             "sigma_min": 0.01,
             "sigma_final": 0,
-            "schedule": "sqrt",
-            "timestep": "log",
+            "schedule": schedule,
+            "timestep": timestep,
         }
         for gamma in gammas:
-            label = regime_label(sigma_max, num_steps)
+            label = regime_label(sigma_max, num_steps, schedule, timestep)
             gamma_label = f"{gamma:g}".replace(".", "p")
             params = {
                 "sigma_max": float(sigma_max),
@@ -67,8 +82,8 @@ def make_pula_entries(regimes, gammas, log_level, k_steps, cg_iter):
                 "gamma": float(gamma),
                 "K": int(k_steps),
                 "cg_iter": int(cg_iter),
-                "schedule": "sqrt",
-                "timestep": "log",
+                "schedule": schedule,
+                "timestep": timestep,
                 "candidate": f"pULA[{label}_g{gamma_label}]",
             }
             entries.append({
@@ -104,8 +119,8 @@ def parse_args():
     parser.add_argument("--slice-offset", type=int, default=0)
     parser.add_argument("--slices", type=int, default=2, help="Number of validation slices per file.")
     parser.add_argument("--regime", dest="regimes", type=parse_regime, action="append",
-                        default=None, metavar="SIGMA_MAX:NUM_STEPS",
-                        help="Paired pULA regime. Repeatable. Default: 0.1:20, 1:40, 10:60.")
+                        default=None, metavar="SIGMA_MAX:NUM_STEPS[:SCHEDULE:TIMESTEP]",
+                        help="Paired pULA regime. Repeatable. Defaults use sqrt/log: 0.1:20, 1:40, 10:60.")
     parser.add_argument("--gammas", nargs="+", type=float, default=[0.25, 0.5, 1.0])
     parser.add_argument("--K", type=int, default=4)
     parser.add_argument("--cg-iter", type=int, default=10)
@@ -172,7 +187,11 @@ def run_acceleration(args, entries, net, dataset, samples, out_dir):
 
 def main():
     args = parse_args()
-    regimes = args.regimes or [(0.1, 20), (1.0, 40), (10.0, 60)]
+    regimes = args.regimes or [
+        (0.1, 20, "sqrt", "log"),
+        (1.0, 40, "sqrt", "log"),
+        (10.0, 60, "sqrt", "log"),
+    ]
     entries = make_pula_entries(regimes, args.gammas, args.log_level, args.K, args.cg_iter)
     if args.list_grid:
         print(json.dumps(entries, indent=2))

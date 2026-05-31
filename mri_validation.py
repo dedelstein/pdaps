@@ -52,6 +52,7 @@ DAPS_TAU = 0.002028752174814177
 WARN_DMO_RATIO = 1.5
 WARN_DMO_NORMAL = 0.035
 WARN_SSIM_FLOOR = 0.40
+DEBUG_MEM_DUMP_GB = 5.0
 
 REVERSE_ODE = {
     "num_steps": 5,
@@ -2915,6 +2916,28 @@ def _pdaps_bugcheck_grid(log_level="INFO"):
     ]
 
 
+def _cuda_mem_probe(tag, dump_top=0):
+    """Leak probe: log live/reserved CUDA memory. If dump_top>0, also list the
+    largest live CUDA tensors (shape/dtype) so we can name what is being held."""
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    print(f"[MEMPROBE] {tag}: allocated={alloc:.3f}GB reserved={reserved:.3f}GB", flush=True)
+    if dump_top > 0:
+        tensors = []
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    tensors.append((obj.element_size() * obj.nelement(), tuple(obj.shape), str(obj.dtype)))
+            except Exception:
+                continue
+        tensors.sort(reverse=True)
+        for nbytes, shape, dtype in tensors[:dump_top]:
+            print(f"[MEMPROBE]   live {nbytes/1e6:.1f}MB {shape} {dtype}", flush=True)
+        print(f"[MEMPROBE]   total live cuda tensors: {len(tensors)}", flush=True)
+
+
 def load_model(args, device):
     net = hydra.utils.instantiate(OmegaConf.create(MODEL_CONFIG))
     ckpt = torch.load(Path(args.models_dir) / args.ckpt_name, map_location=device, weights_only=False)
@@ -3223,6 +3246,9 @@ def parse_args():
                              "where validation and test would be the same samples.")
     parser.add_argument("--save-images", action="store_true",
                         help="Save reconstruction figures for validation rows as well as test rows.")
+    parser.add_argument("--debug-mem", action="store_true",
+                        help="Log live/reserved CUDA memory after each eval cell and dump the largest "
+                             "live tensors past a threshold (leak diagnosis; off by default).")
     parser.add_argument("--grid-preset",
                         choices=("smoke", "tiny", "probe", "full", "final_comparison", "pdaps_inner_sweep",
                                  "pdaps_tight", "iso_nfe", "pdaps_match_nfe",
@@ -3428,6 +3454,8 @@ def _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples
 
     val_rows = _load_resume_rows(out_dir / "validation_raw.csv", args.resume)
     if selected is None:
+        if args.debug_mem:
+            _cuda_mem_probe("baseline before VAL")
         val_done = _successful_row_keys(val_rows)
         for entry in entries:
             for seed in seed_values:
@@ -3444,6 +3472,14 @@ def _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples
                     val_rows.append(row)
                     val_done.add(_row_key(row))
                     write_csv(out_dir / "validation_raw.csv", val_rows)
+                    if args.debug_mem:
+                        _cuda_mem_probe(
+                            f"after VAL {entry['method']} idx={idx}",
+                            dump_top=8 if (
+                                torch.cuda.is_available()
+                                and torch.cuda.memory_allocated() > DEBUG_MEM_DUMP_GB * 1e9
+                            ) else 0,
+                        )
     elif val_rows:
         print("Skipping validation execution because selected.json is already frozen.")
 
@@ -3473,6 +3509,8 @@ def _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples
                 "reason": "skip_test",
             }, f, indent=2)
     else:
+        if args.debug_mem:
+            _cuda_mem_probe("baseline before TEST")
         test_done = _successful_row_keys(test_rows)
         for entry in selected_entries:
             for seed in seed_values:
@@ -3488,6 +3526,14 @@ def _run_one_acceleration(args, entries, net, dataset, val_samples, test_samples
                     test_rows.append(row)
                     test_done.add(_row_key(row))
                     write_csv(out_dir / "test_raw.csv", test_rows)
+                    if args.debug_mem:
+                        _cuda_mem_probe(
+                            f"after TEST {entry['method']} idx={idx}",
+                            dump_top=8 if (
+                                torch.cuda.is_available()
+                                and torch.cuda.memory_allocated() > DEBUG_MEM_DUMP_GB * 1e9
+                            ) else 0,
+                        )
         write_csv(out_dir / "test_summary.csv", summarize(test_rows))
     if args.evaluate_all or args.skip_test:
         write_ablation_artifacts(out_dir, val_rows, test_rows)
