@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 ACCEL=${ACCEL:-4}
 GRID_PRESET="final_comparison"
@@ -13,8 +14,8 @@ SLICE_OFFSET=${SLICE_OFFSET:-0}
 SEED=${SEED:-123}
 
 # One representative config per method in final_comparison:
-#   0=DPS, 3=DAPS, 6=pULA, 9=P-DAPS-core
-METHOD_INDICES=${METHOD_INDICES:-0,3,6,9}
+#   0=DPS, 4=DAPS, 6=pULA, 9=P-DAPS-core
+METHOD_INDICES=${METHOD_INDICES:-0,4,6,9}
 OUT_ROOT=${PDAPS_OUT_ROOT:-results/smoke_${GRID_PRESET}_accel${ACCEL}}
 
 mkdir -p "$OUT_ROOT"

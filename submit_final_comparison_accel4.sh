@@ -12,6 +12,7 @@
 #BSUB -e logs/final_cmp_a4.%J.err
 
 set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 ACCEL=4
 GRID_PRESET="final_comparison"

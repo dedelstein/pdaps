@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import csv
+import gc
 import io
 import itertools
 import json
@@ -68,12 +69,12 @@ DPS_SCHEDULER = {
 }
 
 PULA_SCHEDULER = {
-    "num_steps": 200,
-    "sigma_max": 10,
+    "num_steps": 40,
+    "sigma_max": 1,
     "sigma_min": 0.01,
     "sigma_final": 0,
-    "schedule": "linear",
-    "timestep": "poly-7",
+    "schedule": "sqrt",
+    "timestep": "log",
 }
 
 
@@ -585,7 +586,7 @@ def _final_comparison_grid(log_level="INFO"):
     """
     methods = _baseline_entries(
         dps_scales=[0.5, 1.0, 2.0],
-        daps_lrs=[3e-6, 1e-5, 3e-5],
+        daps_lrs=[1e-6, 3e-6, 1e-5],
         pula_gammas=[0.25, 0.5, 1.0],
         log_level=log_level,
     )
@@ -2971,6 +2972,7 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
         with contextlib.redirect_stdout(_Tee(sys.stdout, log_fh)), contextlib.redirect_stderr(_Tee(sys.stderr, log_fh)):
             start = time.perf_counter()
             try:
+                forward_op = algo = data = observation = target = recon = None
                 forward_op = make_forward_op(args, device)
                 algo = hydra.utils.instantiate(OmegaConf.create(entry["algorithm"]), forward_op=forward_op, net=net)
                 data = move_to_device(sample, device)
@@ -3032,6 +3034,13 @@ def run_one(entry, sample, sample_idx, split, net, args, out_dir,
                 row["error"] = repr(exc)
                 row["traceback"] = traceback.format_exc()
                 row["runtime_s"] = time.perf_counter() - start
+            finally:
+                del recon, target, observation, data, algo, forward_op
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    with contextlib.suppress(Exception):
+                        torch.cuda.ipc_collect()
 
             status_str = f"[FAILED: {row.get('error', 'unknown')}]" if row["failed"] else f"PSNR={row.get('psnr', 0.0):.2f} SSIM={row.get('ssim', 0.0):.4f}"
             print(f"[{entry['method']}] {split.capitalize()} Image {sample_idx} ({filename}): "
