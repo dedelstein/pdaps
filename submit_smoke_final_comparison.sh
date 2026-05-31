@@ -14,4 +14,7 @@
 set -euo pipefail
 
 mkdir -p logs
+export ACCEL=${ACCEL:-4}
+JOB_TAG=${LSB_JOBID:-$(date +%Y%m%d_%H%M%S)}
+export PDAPS_OUT_ROOT=${PDAPS_OUT_ROOT:-results/smoke_final_comparison_accel${ACCEL}_${JOB_TAG}}
 ./smoke_final_comparison.sh
