@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import csv
+import collections
 import gc
 import io
 import itertools
@@ -52,7 +53,7 @@ DAPS_TAU = 0.002028752174814177
 WARN_DMO_RATIO = 1.5
 WARN_DMO_NORMAL = 0.035
 WARN_SSIM_FLOOR = 0.40
-DEBUG_MEM_DUMP_GB = 5.0
+DEBUG_MEM_DUMP_GB = 1.0
 
 REVERSE_ODE = {
     "num_steps": 5,
@@ -2935,6 +2936,14 @@ def _cuda_mem_probe(tag, dump_top=0):
         tensors.sort(reverse=True)
         for nbytes, shape, dtype in tensors[:dump_top]:
             print(f"[MEMPROBE]   live {nbytes/1e6:.1f}MB {shape} {dtype}", flush=True)
+        # Histogram by (shape, dtype): for a per-cell leak the *count* of duplicated
+        # tensors is the smoking gun — it grows by a fixed amount each cell.
+        hist = collections.Counter((shape, dtype) for _, shape, dtype in tensors)
+        bytes_by_key = collections.defaultdict(float)
+        for nbytes, shape, dtype in tensors:
+            bytes_by_key[(shape, dtype)] += nbytes
+        for (shape, dtype), count in sorted(hist.items(), key=lambda kv: -bytes_by_key[kv[0]])[:dump_top]:
+            print(f"[MEMPROBE]   x{count:<4d} {bytes_by_key[(shape, dtype)]/1e6:8.1f}MB total {shape} {dtype}", flush=True)
         print(f"[MEMPROBE]   total live cuda tensors: {len(tensors)}", flush=True)
 
 
