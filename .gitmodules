@@ -1,0 +1,4 @@
+[submodule "libs/inversebench"]
+	path = libs/inversebench
+	url = https://github.com/dedelstein/InverseBench.git
+	branch = main

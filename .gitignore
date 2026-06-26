@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Environments
+.venv/
+.env
+
+# Experiment outputs and model/data artifacts
+outputs/
+results/
+logs/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.png
+*.jpg
+*.jpeg
+*.pdf
+!Dan_Edelstein_s243446_MSc_Thesis.pdf
+*.tex

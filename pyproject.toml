@@ -1,0 +1,33 @@
+[project]
+name = "pdaps"
+version = "0.1.0"
+description = "Minimal public P-DAPS implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "h5py>=3.10.0",
+    "hydra-core>=1.3.2",
+    "inversebench",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "omegaconf>=2.3.0",
+    "scipy>=1.12.0",
+    "sigpy>=0.1.27",
+    "torch>=2.9.0",
+    "tqdm>=4.67.1",
+]
+
+[tool.uv.workspace]
+members = [
+    "libs/inversebench",
+]
+
+[tool.uv.sources]
+inversebench = { workspace = true }
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["dataloader", "espirit", "metrics", "mri_ops", "mri_validation", "pdaps", "pula", "toy_2d"]
