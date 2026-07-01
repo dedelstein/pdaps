@@ -30,4 +30,4 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["dataloader", "espirit", "metrics", "mri_ops", "mri_validation", "pdaps", "pula", "toy_2d"]
+py-modules = ["dataloader", "espirit", "metrics", "mri_ops", "mri_validation", "pdaps", "pdaps_dev", "pula", "toy_2d"]

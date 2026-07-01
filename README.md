@@ -12,10 +12,12 @@ The accompanying thesis is included as [`Dan_Edelstein_s243446_MSc_Thesis.pdf`](
 mri_ops.py            # conjugate gradient and Cartesian multicoil MRI operators
 pula.py               # pULA baseline implementation
 pdaps.py              # P-DAPS sampler, formerly pdaps_v3
+pdaps_dev.py          # compact development/ablation sampler
 metrics.py            # compact MRI reconstruction metrics
 dataloader.py         # fastMRI multicoil HDF5 + ESPIRiT-map dataset
 espirit.py            # ESPIRiT sensitivity-map precomputation utility
 mri_validation.py     # minimal single-slice MRI runner
+compute_leak_vs_floor.py # mask-null leakage vs mismatch-floor diagnostic
 toy_2d.py             # synthetic 2-D toys plus Toy D, the 64-D stiffness toy
 thesis_figures/       # data-free figure-generation scripts; no generated PNGs
 libs/inversebench/    # InverseBench submodule
@@ -111,3 +113,10 @@ fastMRI data and tools:
 ## Notes
 
 This public version does not include thesis experiment scripts, local cluster jobs, private data paths, checkpoints, generated results, or validation artifacts.
+
+`pdaps.py` is the recommended implementation for use. `pdaps_dev.py` is included
+for ablations: it keeps the exact split, the iterative inner correction, and the
+inner-noise/null-anchor controls while omitting the full sweep harness.
+
+`compute_leak_vs_floor.py` is a CPU-only diagnostic for comparing mask-null
+leakage with the model-mismatch floor.
